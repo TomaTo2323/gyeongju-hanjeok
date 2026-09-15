@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from .location_policy import GYEONGJU_CENTER_LATITUDE, GYEONGJU_CENTER_LONGITUDE
+
 
 class TransportMode(str, Enum):
     walking = "walking"
@@ -131,9 +133,17 @@ class Course(BaseModel):
 
 
 class RecommendRequest(BaseModel):
-    latitude: float = Field(ge=-90, le=90)
-    longitude: float = Field(ge=-180, le=180)
+    # User GPS is intentionally not accepted by the backend.
+    # Recommendation services use a fixed Gyeongju service anchor.
     start_time: datetime | None = None
+
+    @property
+    def latitude(self) -> float:
+        return GYEONGJU_CENTER_LATITUDE
+
+    @property
+    def longitude(self) -> float:
+        return GYEONGJU_CENTER_LONGITUDE
     available_minutes: int = Field(default=240, ge=60, le=1440)
     transport: TransportMode = TransportMode.walking
     radius_km: float = Field(default=8, gt=0, le=30)
@@ -187,9 +197,15 @@ class ModifyCourseRequest(BaseModel):
 
 class RecalculateRequest(BaseModel):
     course: Course
-    current_latitude: float
-    current_longitude: float
     remaining_available_minutes: int = Field(ge=30, le=1440)
+
+    @property
+    def current_latitude(self) -> float:
+        return GYEONGJU_CENTER_LATITUDE
+
+    @property
+    def current_longitude(self) -> float:
+        return GYEONGJU_CENTER_LONGITUDE
     transport: TransportMode
     preferences: list[str] = Field(default_factory=list)
 
@@ -208,9 +224,8 @@ class JourneyOut(BaseModel):
 
 class VisitCheckRequest(BaseModel):
     place_id: str
-    current_latitude: float
-    current_longitude: float
-    dwell_minutes: int = Field(ge=0)
+    # The device verifies the GPS/dwell condition locally; only the result is sent.
+    verified_on_device: bool = True
 
 
 class VisitCheckResponse(BaseModel):

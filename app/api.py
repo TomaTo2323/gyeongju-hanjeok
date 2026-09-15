@@ -19,6 +19,7 @@ from .clients import (
     normalize_name,
 )
 from .config import Settings, get_settings
+from .location_policy import GYEONGJU_CENTER_LATITUDE, GYEONGJU_CENTER_LONGITUDE
 from .db import get_db
 from .geo import haversine_km
 from .schemas import (
@@ -175,8 +176,6 @@ def health(
     tags=["places"],
 )
 async def places(
-    latitude: float,
-    longitude: float,
     radius_km: float = Query(8, gt=0, le=20),
     limit: int = Query(30, ge=1, le=100),
     settings: Settings = Depends(get_settings),
@@ -191,6 +190,9 @@ async def places(
     congestion_score의 기준은 0~100입니다.
     0 = 매우 한산 / 100 = 매우 혼잡
     """
+
+    latitude = GYEONGJU_CENTER_LATITUDE
+    longitude = GYEONGJU_CENTER_LONGITUDE
 
     cache_key = _places_cache_key(
         latitude,
@@ -495,55 +497,43 @@ async def content(
     )
 
 
-@router.post(
-    "/api/v1/etiquette/nearby",
-    response_model=EtiquetteResponse,
+@router.get(
+    "/api/v1/etiquette/place/{place_id}",
     tags=["etiquette"],
 )
-async def etiquette(
-    body: EtiquetteRequest,
+async def etiquette_for_place(
+    place_id: str,
+    content_type_id: str = Query("12"),
     settings: Settings = Depends(get_settings),
 ):
+    """Return etiquette tips for a selected public tourist place.
+
+    No live user GPS is accepted or transmitted.
+    """
+    tips = [
+        "문화재와 시설물을 만지거나 훼손하지 마세요.",
+        "촬영 제한 표지와 관람 동선을 지켜주세요.",
+        "주변 관람객과 주민을 위해 큰 소리를 줄여주세요.",
+    ]
     try:
-        nearby = await TourApiClient(
-            settings
-        ).nearby_places(
-            body.latitude,
-            body.longitude,
-            body.radius_m,
-            10,
+        placeholder = Place(
+            place_id=place_id,
+            content_type_id=content_type_id,
+            title=place_id,
+            latitude=GYEONGJU_CENTER_LATITUDE,
+            longitude=GYEONGJU_CENTER_LONGITUDE,
         )
+        place = await TourApiClient(settings).detail(placeholder)
+        if "사" in place.title or "암" in place.title:
+            tips.append(
+                "사찰에서는 법회와 참배를 방해하지 않도록 복장과 소음을 조심하세요."
+            )
+        return {"place_id": place_id, "messages": tips}
     except IntegrationError as exc:
         raise HTTPException(
             exc.status_code,
-            detail=str(exc),
+            detail={"service": exc.service, "message": str(exc)},
         ) from exc
-
-    messages: list[str] = []
-
-    if nearby:
-        messages.extend(
-            [
-                "문화재와 시설물을 만지거나 훼손하지 마세요.",
-                "촬영 제한 표지와 관람 동선을 지켜주세요.",
-                "주변 관람객과 주민을 위해 큰 소리를 줄여주세요.",
-            ]
-        )
-
-        if any(
-            "사" in place.title
-            or "암" in place.title
-            for place in nearby
-        ):
-            messages.append(
-                "사찰에서는 법회와 참배를 방해하지 않도록 "
-                "복장과 소음을 조심하세요."
-            )
-
-    return EtiquetteResponse(
-        nearby_places=nearby,
-        messages=messages,
-    )
 
 
 @router.post(
@@ -601,9 +591,7 @@ def visit(
         ).visit(
             journey_id,
             body.place_id,
-            body.current_latitude,
-            body.current_longitude,
-            body.dwell_minutes,
+            body.verified_on_device,
         )
 
     except KeyError as exc:
@@ -654,16 +642,14 @@ async def congestion(
     tags=["weather"],
 )
 async def current_weather(
-    latitude: float,
-    longitude: float,
     settings: Settings = Depends(get_settings),
 ):
     try:
         return await WeatherClient(
             settings
         ).current(
-            latitude,
-            longitude,
+            GYEONGJU_CENTER_LATITUDE,
+            GYEONGJU_CENTER_LONGITUDE,
         )
 
     except IntegrationError as exc:

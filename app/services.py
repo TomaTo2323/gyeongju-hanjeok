@@ -6037,9 +6037,7 @@ class JourneyService:
         self,
         journey_id: str,
         place_id: str,
-        current_latitude: float,
-        current_longitude: float,
-        dwell_minutes: int,
+        verified_on_device: bool,
     ) -> VisitCheckResponse:
         record = self.db.get(
             JourneyRecord,
@@ -6070,20 +6068,10 @@ class JourneyService:
                 "해당 장소가 코스에 없습니다."
             )
 
-        distance_m = (
-            haversine_km(
-                current_latitude,
-                current_longitude,
-                place.latitude,
-                place.longitude,
-            )
-            * 1000
-        )
-
-        completed = (
-            distance_m <= 50
-            and dwell_minutes >= 10
-        )
+        # GPS/dwell verification is performed on the user's device.
+        # The backend never receives the live GPS coordinate.
+        distance_m = 0.0
+        completed = bool(verified_on_device)
 
         if (
             completed
@@ -6108,9 +6096,9 @@ class JourneyService:
             self.db.commit()
 
         reason = (
-            "반경 50m 이내에서 10분 이상 체류해 방문 완료 처리했습니다."
+            "단말기에서 위치 기반 방문 조건을 확인해 방문 완료 처리했습니다."
             if completed
-            else "방문 완료 조건(50m 이내·10분 이상)을 충족하지 않았습니다."
+            else "단말기에서 방문 완료 조건이 확인되지 않았습니다."
         )
 
         return VisitCheckResponse(

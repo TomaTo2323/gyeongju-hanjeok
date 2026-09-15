@@ -25,6 +25,7 @@ from .clients import (
     normalize_name,
 )
 from .config import Settings, get_settings
+from .location_policy import GYEONGJU_CENTER_LATITUDE, GYEONGJU_CENTER_LONGITUDE
 from .enrichment import PlaceInfoEnricher
 from .geo import haversine_km
 from .schemas import Course, CoursePlace, CourseType, Place, RecommendRequest, TransportMode
@@ -42,8 +43,8 @@ from .services import (
 
 compat_router = APIRouter(tags=["frontend-compat"])
 
-DEFAULT_LATITUDE = 35.8562
-DEFAULT_LONGITUDE = 129.2247
+DEFAULT_LATITUDE = GYEONGJU_CENTER_LATITUDE
+DEFAULT_LONGITUDE = GYEONGJU_CENTER_LONGITUDE
 
 
 PLACE_DETAIL_CACHE_TTL_SECONDS = 15 * 60
@@ -186,9 +187,16 @@ DEBUG_CONGESTION_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 class FrontRecommendRequest(BaseModel):
-    start_latitude: float = DEFAULT_LATITUDE
-    start_longitude: float = DEFAULT_LONGITUDE
+    # Live user GPS is never accepted by the backend.
     available_hours: float = Field(default=4, gt=0, le=24)
+
+    @property
+    def start_latitude(self) -> float:
+        return DEFAULT_LATITUDE
+
+    @property
+    def start_longitude(self) -> float:
+        return DEFAULT_LONGITUDE
     transport_type: str = "car"
     radius_km: float = Field(default=15, gt=0, le=30)
     preferred_categories: list[str] = Field(default_factory=list)
@@ -610,8 +618,6 @@ def _to_backend_request(
     )
 
     return RecommendRequest(
-        latitude=body.start_latitude,
-        longitude=body.start_longitude,
         available_minutes=max(
             60,
             round(
@@ -2426,101 +2432,21 @@ async def debug_congestion_v2(
 async def front_places(
     query: str = "",
     category: str = "",
-    latitude: float = DEFAULT_LATITUDE,
-    longitude: float = DEFAULT_LONGITUDE,
     radius_km: float = Query(15, gt=0, le=20),
     limit: int = Query(30, ge=1, le=100),
     settings: Settings = Depends(get_settings),
 ):
-    return {"places": await _list_places(latitude=latitude, longitude=longitude, radius_km=radius_km, limit=limit, query=query, category=category, settings=settings)}
-
-
-@compat_router.get("/places/nearest-tourist")
-async def front_nearest_tourist(
-    latitude: float,
-    longitude: float,
-    settings: Settings = Depends(get_settings),
-):
-    try:
-        tour_places, kakao_rows = await asyncio.gather(
-            asyncio.wait_for(
-                _nearest_tourist_pool(settings),
-                timeout=5.0,
-            ),
-            asyncio.wait_for(
-                KakaoLocalClient(
-                    settings
-                ).category_search(
-                    "AT4",
-                    latitude=latitude,
-                    longitude=longitude,
-                    radius_m=2500,
-                    limit=15,
-                ),
-                timeout=1.5,
-            ),
+    return {
+        "places": await _list_places(
+            latitude=DEFAULT_LATITUDE,
+            longitude=DEFAULT_LONGITUDE,
+            radius_km=radius_km,
+            limit=limit,
+            query=query,
+            category=category,
+            settings=settings,
         )
-    except Exception:
-        try:
-            tour_places = await asyncio.wait_for(
-                _nearest_tourist_pool(settings),
-                timeout=3.0,
-            )
-        except Exception:
-            tour_places = []
-
-        try:
-            kakao_rows = await asyncio.wait_for(
-                KakaoLocalClient(
-                    settings
-                ).category_search(
-                    "AT4",
-                    latitude=latitude,
-                    longitude=longitude,
-                    radius_m=2500,
-                    limit=15,
-                ),
-                timeout=1.5,
-            )
-        except Exception:
-            kakao_rows = []
-
-    selected = select_representative_start_place(
-        tour_places,
-        kakao_rows,
-        latitude,
-        longitude,
-        max_distance_km=1.5,
-    )
-
-    if selected is None:
-        raise HTTPException(
-            404,
-            detail=(
-                "출발 위치 주변 대표 관광지를 "
-                "확인하지 못했습니다."
-            ),
-        )
-
-    print(
-        "[START LABEL]"
-        f" title={selected.title}"
-        f" distance_km="
-        f"{selected.distance_km or 0.0:.3f}"
-    )
-
-    return _place_to_front(selected)
-
-
-@compat_router.get("/places/nearby")
-async def front_nearby_places(
-    latitude: float,
-    longitude: float,
-    radius_km: float = Query(15, gt=0, le=20),
-    limit: int = Query(30, ge=1, le=100),
-    settings: Settings = Depends(get_settings),
-):
-    return {"places": await _list_places(latitude=latitude, longitude=longitude, radius_km=radius_km, limit=limit, query="", category="", settings=settings)}
+    }
 
 
 def _exact_local_match(
@@ -3126,8 +3052,6 @@ async def front_place_detail(
     content_type_id: str = "",
     title: str = "",
     address: str = "",
-    latitude: float = 0,
-    longitude: float = 0,
     stage: str = "core",
     settings: Settings = Depends(
         get_settings
@@ -3194,21 +3118,15 @@ async def front_place_detail(
                 address.strip()
                 or None
             ),
-            latitude=(
-                latitude
-                or DEFAULT_LATITUDE
-            ),
-            longitude=(
-                longitude
-                or DEFAULT_LONGITUDE
-            ),
+            latitude=DEFAULT_LATITUDE,
+            longitude=DEFAULT_LONGITUDE,
         )
 
         core = await _load_place_detail_core(
             seed=seed,
             settings=settings,
-            latitude=latitude,
-            longitude=longitude,
+            latitude=DEFAULT_LATITUDE,
+            longitude=DEFAULT_LONGITUDE,
         )
 
         _place_detail_cache_set(
@@ -3595,17 +3513,9 @@ async def front_replace_stop(
             or ""
         ).strip()
 
-        start_latitude = float(
-            body.get("start_latitude")
-            or body.get("startLatitude")
-            or DEFAULT_LATITUDE
-        )
-
-        start_longitude = float(
-            body.get("start_longitude")
-            or body.get("startLongitude")
-            or DEFAULT_LONGITUDE
-        )
+        # User GPS is not accepted. The server uses only the fixed Gyeongju anchor.
+        start_latitude = DEFAULT_LATITUDE
+        start_longitude = DEFAULT_LONGITUDE
 
         transport_raw = str(
             body.get("transport_type")
@@ -3886,8 +3796,6 @@ async def front_modify(
         else:
             # 구버전 프론트 fallback.
             request = RecommendRequest(
-                latitude=DEFAULT_LATITUDE,
-                longitude=DEFAULT_LONGITUDE,
                 desired_course_count=1,
             )
 
@@ -3988,9 +3896,12 @@ def front_check_in(body: FrontCheckInRequest):
 
 
 @compat_router.get("/weather/current")
-async def front_weather(latitude: float = DEFAULT_LATITUDE, longitude: float = DEFAULT_LONGITUDE, settings: Settings = Depends(get_settings)):
+async def front_weather(settings: Settings = Depends(get_settings)):
     try:
-        weather = await WeatherClient(settings).current(latitude, longitude)
+        weather = await WeatherClient(settings).current(
+            DEFAULT_LATITUDE,
+            DEFAULT_LONGITUDE,
+        )
     except IntegrationError as exc:
         raise HTTPException(exc.status_code, detail={"service": exc.service, "message": str(exc)}) from exc
     raining = bool(weather.get("raining"))
