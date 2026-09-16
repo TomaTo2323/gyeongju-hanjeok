@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from .clients import (
     CongestionClient,
@@ -25,12 +26,14 @@ from .clients import (
     normalize_name,
 )
 from .config import Settings, get_settings
+from .db import get_db
 from .location_policy import GYEONGJU_CENTER_LATITUDE, GYEONGJU_CENTER_LONGITUDE
 from .enrichment import PlaceInfoEnricher
 from .geo import haversine_km
-from .schemas import Course, CoursePlace, CourseType, Place, RecommendRequest, TransportMode
+from .schemas import ChatTurn, Course, CoursePlace, CourseType, Place, RagSearchResponse, RecommendRequest, TransportMode
 from .services import (
     ContentService,
+    RagService,
     RecommendationService,
     _apply_community_live_signal,
     _community_live_signal_map,
@@ -3872,6 +3875,23 @@ async def front_modify(
             detail=str(exc),
         ) from exc
 
+
+
+
+class FrontChatAskRequest(BaseModel):
+    message: str = Field(min_length=2, max_length=500)
+    top_k: int = Field(default=5, ge=1, le=10)
+    history: list[ChatTurn] = Field(default_factory=list, max_length=8)
+
+
+@compat_router.post("/chat/ask", response_model=RagSearchResponse)
+async def front_chat_ask(body: FrontChatAskRequest, db: Session = Depends(get_db), settings: Settings = Depends(get_settings)):
+    try:
+        return await RagService(settings, db).search(body.message, body.top_k, history=body.history)
+    except IntegrationError as exc:
+        raise HTTPException(exc.status_code, detail={"service": exc.service, "message": str(exc)}) from exc
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
 
 @compat_router.get("/etiquette/place/{place_id}")
 async def front_etiquette(place_id: str, content_type_id: str = "12", settings: Settings = Depends(get_settings)):

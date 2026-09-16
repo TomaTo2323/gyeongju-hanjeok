@@ -28,6 +28,7 @@ from .config import Settings
 from .db import (
     CommunityPostRecord,
     JourneyRecord,
+    KnowledgeDocument,
     PlaceRecord,
     SessionLocal,
 )
@@ -35,6 +36,7 @@ from .enrichment import PlaceInfoEnricher
 from .geo import haversine_km
 from .optimizer import Individual, optimize_courses
 from .schemas import (
+    ChatTurn,
     ContentItem,
     Course,
     CoursePlace,
@@ -1804,7 +1806,6 @@ def _time_congestion_score(
     """
     local = _safe_local_datetime(when)
     hour = local.hour
-    weekend = local.weekday() >= 5
     profile = _place_profile(place)
 
     if profile == "night":
@@ -1830,16 +1831,53 @@ def _time_congestion_score(
             score = 20.0
 
     elif profile == "commercial":
-        if 8 <= hour <= 10:
-            score = 35.0
-        elif 11 <= hour <= 14:
-            score = 78.0
-        elif 15 <= hour <= 17:
-            score = 70.0
-        elif 18 <= hour <= 21:
-            score = 88.0
+        # 음식점과 쇼핑은 같은 KTO commercial 계열이지만 실제 피크가 다릅니다.
+        # 음식점은 점심/저녁, 쇼핑은 오후~저녁 중심으로 분리합니다.
+        category = (place.category or "").strip()
+        if category == "음식점":
+            if 8 <= hour <= 10:
+                score = 28.0
+            elif 11 <= hour <= 14:
+                score = 86.0
+            elif 15 <= hour <= 17:
+                score = 48.0
+            elif 18 <= hour <= 21:
+                score = 92.0
+            else:
+                score = 24.0
+        elif category == "쇼핑":
+            if 9 <= hour <= 11:
+                score = 42.0
+            elif 12 <= hour <= 17:
+                score = 74.0
+            elif 18 <= hour <= 20:
+                score = 70.0
+            else:
+                score = 28.0
         else:
-            score = 32.0
+            if 8 <= hour <= 10:
+                score = 35.0
+            elif 11 <= hour <= 14:
+                score = 78.0
+            elif 15 <= hour <= 17:
+                score = 70.0
+            elif 18 <= hour <= 21:
+                score = 88.0
+            else:
+                score = 32.0
+
+    elif profile == "lodging":
+        # 숙박은 관광지처럼 한낮이 붐비기보다 체크인/저녁 시간에 수요가 집중됩니다.
+        if 7 <= hour <= 10:
+            score = 48.0
+        elif 11 <= hour <= 14:
+            score = 30.0
+        elif 15 <= hour <= 18:
+            score = 68.0
+        elif 19 <= hour <= 22:
+            score = 72.0
+        else:
+            score = 34.0
 
     elif profile == "nature":
         if 7 <= hour <= 10:
@@ -1893,11 +1931,23 @@ def _time_congestion_score(
         else:
             score = 26.0
 
-    if weekend:
+    # 주말 효과를 토/일 동일값으로 뭉치지 않고 금요일 저녁과 일요일을 완만하게 구분합니다.
+    weekday = local.weekday()
+    if weekday == 5:  # 토요일
         if profile in {"commercial", "night", "event"}:
             score += 14.0
         elif profile != "lodging":
             score += 10.0
+    elif weekday == 6:  # 일요일
+        if profile in {"commercial", "night", "event"}:
+            score += 11.0
+        elif profile != "lodging":
+            score += 8.0
+    elif weekday == 4 and hour >= 17:  # 금요일 저녁
+        if profile in {"commercial", "night", "event"}:
+            score += 7.0
+        elif profile != "lodging":
+            score += 4.0
 
     return max(0.0, min(100.0, score))
 
@@ -4163,7 +4213,7 @@ class RecommendationService:
         naver_popularity: float | None = None,
     ) -> None:
         """
-        경주한적 혼잡도 V2 (0~100).
+        경주한적 혼잡도 V2.4.5 (0~100).
 
         - 장소 baseline
         - 관광공사 분류 기반 시간/요일 패턴
@@ -4236,17 +4286,20 @@ class RecommendationService:
                 )
             )
 
-        weather_score = _weather_congestion_score(
-            place,
-            weather,
-        )
-        signals.append(
-            (
-                "weather",
-                weather_score,
-                CONGESTION_WEIGHT_WEATHER,
+        # 날씨 데이터가 실제로 있을 때만 신호로 사용합니다.
+        # 외부 데이터 누락을 중립값 50으로 채우면 가중치 재정규화 원칙을 깨므로 제외합니다.
+        if weather:
+            weather_score = _weather_congestion_score(
+                place,
+                weather,
             )
-        )
+            signals.append(
+                (
+                    "weather",
+                    weather_score,
+                    CONGESTION_WEIGHT_WEATHER,
+                )
+            )
 
         regional_weight = _regional_effective_weight(
             regional_demand
@@ -6143,6 +6196,697 @@ class SyncService:
             settings
         )
 
+    # 관광공사 원본 데이터에서 areacode가 비어있어 지역 기반 목록 조회(gyeongju_places)에
+    # 걸리지 않는 경주 대표 유적지 목록. 실제 TourAPI 응답을 확인해 areacode가 빈 값으로
+    # 나오는 것을 확인한 항목들만 넣었다. 지역 기반 목록/코스 추천 로직(gyeongju_places)은
+    # 그대로 두고, RAG 색인용으로만 아래 검색 결과를 보충한다.
+    LANDMARK_BACKFILL_KEYWORDS = (
+        "첨성대", "불국사", "석굴암", "경주 대릉원", "양동마을", "분황사",
+        "경주 계림", "월정교", "황룡사지", "감은사지", "문무대왕릉",
+        "국립경주박물관", "보문호", "경주 오릉", "태종무열왕릉", "경주 진덕여왕릉",
+        "경주 포석정", "경주 김유신묘", "경주 월성",
+    )
+
+    # 관광지 데이터와 별도로 RAG 코퍼스에 포함하는 에티켓 안내 문서.
+    # 기존 /api/v1/etiquette/nearby(app/api.py)의 규칙 기반 안내 문구를 그대로
+    # 재사용해 새 사실을 지어내지 않고, 검색 가능한 문서 형태로만 정리했다.
+    ETIQUETTE_DOCUMENTS = (
+        {
+            "doc_id": "etiquette-general",
+            "title": "경주 문화재·관광지 공통 에티켓",
+            "category": "에티켓",
+            "text": (
+                "경주의 문화재와 관광지를 방문할 때 지켜야 할 공통 에티켓입니다.\n"
+                "- 문화재와 시설물을 만지거나 훼손하지 마세요.\n"
+                "- 촬영 제한 표지와 관람 동선을 지켜주세요.\n"
+                "- 주변 관람객과 주민을 위해 큰 소리를 줄여주세요."
+            ),
+        },
+        {
+            "doc_id": "etiquette-temple",
+            "title": "경주 사찰 방문 에티켓",
+            "category": "에티켓",
+            "text": (
+                "불국사, 석굴암 등 경주의 사찰을 방문할 때 지켜야 할 에티켓입니다.\n"
+                "- 사찰에서는 법회와 참배를 방해하지 않도록 복장과 소음을 조심하세요.\n"
+                "- 문화재와 시설물을 만지거나 훼손하지 마세요.\n"
+                "- 촬영 제한 표지와 관람 동선을 지켜주세요."
+            ),
+        },
+        {
+            "doc_id": "etiquette-operating-hours",
+            "title": "관람시간·야간개장·휴무일 확인 안내",
+            "category": "에티켓",
+            "text": (
+                "경주 관광지의 관람 가능 시간, 야간 개장 여부, 휴무일은 관광지마다 다릅니다.\n"
+                "특정 관광지의 야간 관람 가능 여부나 휴무일이 궁금하면, 이 챗봇에서 해당 "
+                "관광지명을 함께 물어보면 관광공사에 등록된 운영시간·휴무일 정보를 안내해 "
+                "드립니다. 등록된 정보가 없는 경우에는 확인이 어렵다고 안내합니다."
+            ),
+        },
+        {
+            "doc_id": "etiquette-parking-fee",
+            "title": "주차·입장료 확인 안내",
+            "category": "에티켓",
+            "text": (
+                "경주 관광지의 주차 가능 여부와 입장료(요금)는 관광지마다 다르며, 관광공사에 "
+                "등록된 정보가 있는 경우에만 안내할 수 있습니다. 특정 관광지의 주차나 요금이 "
+                "궁금하면 관광지명을 함께 물어보세요. 등록된 정보가 없으면 확인이 어렵다고 "
+                "안내합니다."
+            ),
+        },
+    )
+
+    # 유모차/휠체어 등 접근성 정보는 TourAPI(관광공사)에는 거의 비어 있어, 한국관광공사가
+    # 운영하는 무장애 관광정보 사이트(열린관광 모두의 여행, access.visitkorea.or.kr)의
+    # 공식 페이지를 사람이 직접 확인해 정리했다. 방문객이 많이 묻는 주요 관광지만 우선
+    # 포함했고, 시설은 바뀔 수 있어 문서마다 확인 시점과 출처를 명시한다.
+    ACCESSIBILITY_DOCUMENTS = (
+        {
+            "doc_id": "accessibility-donggung-wolji",
+            "title": "경주 동궁과 월지 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 동궁과 월지의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 "
+                "모두의 여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 유모차: 대여 서비스는 확인되지 않으나, 유아용 편의시설이 있어 유모차 출입은 가능합니다.\n"
+                "- 휠체어 대여: 관리사무실에서 3대 대여 가능합니다.\n"
+                "- 이동로: 주출입구와 전각 주변은 평탄하지만, 외부 탐방로는 흙길이며 곳곳에 불규칙하게 "
+                "기울거나 경사진 구간이 있어 휠체어 이용자는 접근이 어려운 곳이 있습니다.\n"
+                "- 장애인 주차장: 입구 맞은편 가장 가까운 곳에 7면 있습니다.\n"
+                "- 장애인 화장실: 있습니다.\n"
+                "- 수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-cheomseongdae",
+            "title": "경주 첨성대 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 첨성대의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 모두의 "
+                "여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 휠체어: 출입구까지 턱이 없어 접근 가능합니다. 다만 휠체어 대여 서비스는 확인되지 "
+                "않았습니다.\n"
+                "- 장애인 주차장: 있습니다.\n"
+                "- 장애인 화장실: 월성입구에 있습니다.\n"
+                "- 유모차: 대여 서비스는 확인되지 않았고, 여자화장실 내 기저귀갈이대만 확인됩니다.\n"
+                "- 수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-bulguksa",
+            "title": "경주 불국사 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 불국사의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 모두의 "
+                "여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 유모차: 대여 가능합니다.\n"
+                "- 휠체어: 무료로 8대까지 대여 가능하며, 주출입구에서 대웅전까지 경사로가 설치되어 "
+                "이동이 원활합니다.\n"
+                "- 장애인 주차장: 주출입구 근처에 있고, 장애인 탑승 차량은 매표소까지 진입할 수 "
+                "있습니다.\n"
+                "- 장애인 화장실: 주차장과 사찰 내부에 각 1곳씩 있습니다.\n"
+                "- 수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-seokguram",
+            "title": "경주 석굴암 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 석굴암의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 모두의 "
+                "여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 휠체어: 일주문에서 대여 가능합니다. 주출입구는 턱이 없어 접근 가능하지만, "
+                "주차장에서 매표소까지 경사로가 있어 도움이 필요할 수 있습니다.\n"
+                "- 장애인 주차장: 석굴암주차장에 2면 있습니다.\n"
+                "- 장애인 화장실: 있습니다.\n"
+                "- 유모차 대여·수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-daereungwon",
+            "title": "경주 대릉원 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 대릉원(천마총 일원)의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: "
+                "열린관광 모두의 여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 유모차: 정문 매표소에서 대여 가능합니다.\n"
+                "- 휠체어: 대여 가능하며, 출입구까지 턱이 없어 접근하기 좋습니다.\n"
+                "- 장애인 주차장: 있습니다.\n"
+                "- 장애인 화장실: 있습니다.\n"
+                "- 수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-gyeongju-museum",
+            "title": "국립경주박물관 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "국립경주박물관의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 모두의 "
+                "여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 유모차: 대여 가능합니다.\n"
+                "- 휠체어: 정문에서 대여 가능하며, 주출입구에 경사로와 엘리베이터가 있습니다.\n"
+                "- 장애인 주차장: 있습니다.\n"
+                "- 장애인 화장실: 있습니다.\n"
+                "- 수유실: 신라역사관에 있습니다.\n"
+                "- 그 밖에 시각장애인을 위한 음성안내기 대여와 전시관별 점자 키오스크가 있습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-bomun",
+            "title": "경주 보문관광단지·보문호 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 보문관광단지(보문호 일원)의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: "
+                "열린관광 모두의 여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 휠체어: 대여 가능(여행코스 지도 참고)하며, 출입구까지 턱이 없어 접근 가능합니다.\n"
+                "- 이동로: 도보길 대부분은 평탄하지만 경사진 구간이 여러 곳 있어 보호자 동반을 "
+                "권장합니다.\n"
+                "- 장애인 주차장: 있습니다.\n"
+                "- 장애인 화장실: 있습니다.\n"
+                "- 유모차 대여·수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-bunhwangsa",
+            "title": "경주 분황사 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 분황사의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 모두의 "
+                "여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 휠체어: 주출입구에 경사로가 있어 접근 가능하지만, 접근로에 흙·돌 구간이 있어 "
+                "완전히 평탄하지는 않습니다.\n"
+                "- 장애인 주차장: 7대 규모로 있습니다.\n"
+                "- 장애인 화장실: 있습니다.\n"
+                "- 유모차 대여·수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-woljeonggyo",
+            "title": "경주 월정교 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 월정교의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 모두의 "
+                "여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 휠체어: 출입구까지 턱이 없고 주출입구에 경사로가 있어 접근 가능합니다.\n"
+                "- 장애인 주차장: 월정교주차장에 14대 규모로 있습니다.\n"
+                "- 장애인 화장실: 있습니다.\n"
+                "- 유모차 대여·휠체어 대여 서비스: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-yangdong",
+            "title": "경주 양동마을 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 양동마을(유네스코 세계유산)의 무장애 편의시설 정보입니다 (2026년 9월 확인, "
+                "출처: 열린관광 모두의 여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 휠체어: 사무실에서 4대 대여 가능합니다.\n"
+                "- 장애인 주차장: 전용 구역이 있습니다.\n"
+                "- 장애인 화장실: 있습니다.\n"
+                "- 유모차 대여, 휠체어 이동로 상세정보, 수유실: 정보가 확인되지 않았습니다. 마을이 "
+                "넓고 옛 골목길 위주라 방문 전 경주 장애인관광도우미센터(054-762-2630)에 문의하는 "
+                "것을 권장합니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-oreung",
+            "title": "경주 오릉 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 오릉의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 모두의 여행 "
+                "access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 유모차: 입구 매표소에서 1대 대여 가능합니다.\n"
+                "- 휠체어: 입구 매표소에서 1대 대여 가능합니다. 주요 보행로는 평탄하지만, 숭덕전과 "
+                "알영전으로 가는 접근로는 계단이라 휠체어로 관람하기 어렵습니다.\n"
+                "- 장애인 주차장: 주출입구 바로 앞에 2대 있습니다.\n"
+                "- 장애인 화장실: 오릉 내부에 있습니다(남녀공용, 고정식 수평손잡이만).\n"
+                "- 수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-kimyusin-tomb",
+            "title": "경주 김유신묘 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 김유신묘의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 모두의 "
+                "여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 유모차·휠체어: 매표소에서 각 1대(수동)씩 대여 가능하며, 신분증이 필요합니다.\n"
+                "- 이동로: 주차장 진입 전 경사로가 있고 나무 데크 바닥이며, 휠체어 이동로는 약 30m "
+                "경사로로 여유 공간이 넓은 편입니다.\n"
+                "- 장애인 주차장: 2대 주차 가능하며 주변 공간이 충분합니다.\n"
+                "- 장애인 화장실: 주차장 옆에 있으며 시설관리자 호출 장치가 있습니다.\n"
+                "- 수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-wolseong",
+            "title": "경주 월성(반월성) 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주 월성(반월성)의 무장애 편의시설 정보입니다 (2026년 9월 확인, 출처: 열린관광 "
+                "모두의 여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 이동로: 보행로 대부분은 경사로 또는 평탄한 흙포장길이지만, 석빙고 내부는 계단이라 "
+                "휠체어로 관람할 수 없습니다.\n"
+                "- 장애인 화장실: 월성 입구 오른쪽, 첨성대 방향에 남녀 구분된 공중화장실 내 장애인용 "
+                "화장실이 있습니다.\n"
+                "- 유모차·휠체어 대여, 장애인 주차장, 수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-gyeongju-world",
+            "title": "경주월드 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주월드(놀이공원·캘리포니아비치)의 무장애 편의시설 정보입니다 (2026년 9월 확인, "
+                "출처: 열린관광 모두의 여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 유모차: 대여료 2,000원이며 대여 시 신분증을 맡겨야 합니다.\n"
+                "- 휠체어: 무료 대여이며 복지카드가 필요합니다.\n"
+                "- 장애인 주차장: 주출입구 바로 앞에 12대 있습니다.\n"
+                "- 장애인 화장실: 손잡이·등받이가 있고 관리자 호출 장치가 있습니다.\n"
+                "- 수유실: 있습니다.\n"
+                "- 원내 이동 공간은 충분한 편입니다."
+            ),
+        },
+        {
+            "doc_id": "accessibility-expo-park",
+            "title": "경주엑스포대공원·경주타워 접근성(유모차·휠체어) 안내",
+            "category": "접근성",
+            "text": (
+                "경주엑스포대공원(경주타워 포함)의 무장애 편의시설 정보입니다 (2026년 9월 확인, "
+                "출처: 열린관광 모두의 여행 access.visitkorea.or.kr, 한국관광공사).\n"
+                "- 유모차·휠체어: 종합안내센터에서 각각 무료로 대여할 수 있습니다. 출입통로는 단차가 "
+                "없고 경사가 매우 완만합니다.\n"
+                "- 이동로: 공원 보행로는 대부분 평지이거나 완만한 경사로입니다. 다만 공원 가장 깊은 "
+                "곳에 있는 솔거미술관은 경사가 급해 동반자의 도움이 필요할 수 있고, 화랑숲(야간 "
+                "유료 체험 구간)은 산길이라 휠체어 접근이 어렵습니다.\n"
+                "- 장애인 주차장: 서쪽 주차장에 10대 이상 있습니다.\n"
+                "- 장애인 화장실: 경주타워를 비롯한 대형 건물과 야외 곳곳에 있습니다.\n"
+                "- 수유실: 정보가 확인되지 않았습니다."
+            ),
+        },
+    )
+
+    # 외국인 방문객이 궁금해할 만한 내용을 정리한 문서. 특정 국가·인종을 겨냥해
+    # "이 나라 사람은 이렇다"는 식으로 일반화하지 않고, ① 신라와 다른 문화권의 실제
+    # 역사적 교류(검증된 유물·유적 기준), ② 국적과 무관하게 누구에게나 적용되는 종교
+    # /문화시설 예절, ③ 외국인 여행자 실용정보로만 구성했다. 학계에서 이견이 있는
+    # 내용(처용 설화)은 정설처럼 쓰지 않고 이견이 있다는 점을 그대로 남겼다.
+    INTERNATIONAL_VISITOR_DOCUMENTS = (
+        {
+            "doc_id": "intl-silk-road-glass",
+            "title": "신라와 실크로드: 고분 속 유리공예품",
+            "category": "역사·국제교류",
+            "text": (
+                "경주 고분에서는 신라와 서역(지금의 중앙아시아·서아시아·지중해 지역)의 교류를 "
+                "보여주는 유리그릇이 다수 출토되었습니다 (출처: 국립중앙박물관, 우리역사넷).\n"
+                "- 황남대총을 비롯한 경주의 왕릉급 무덤에서 복원된 유리용기만 20여 점이며, 로마제국 "
+                "후기(4~5세기)의 로만글라스나 사산조 페르시아(3~7세기)의 사산글라스로 분석됩니다.\n"
+                "- 황남대총 북분 출토 유리그릇은 사산조 페르시아 계통으로, 북방 초원길을 거쳐 고구려를 "
+                "통해 신라로 들어온 것으로 추정됩니다.\n"
+                "- 이 유물들은 국립경주박물관에 전시되어 있으며, 신라가 실크로드를 통해 먼 지역과 "
+                "교류했음을 보여주는 대표적인 증거로 꼽힙니다."
+            ),
+        },
+        {
+            "doc_id": "intl-gyerimro-sword",
+            "title": "경주 계림로 보검: 중앙아시아 양식의 유물",
+            "category": "역사·국제교류",
+            "text": (
+                "경주 계림로 보검(보물, 흔히 '신라 황금보검'으로도 알려짐)은 신라와 중앙아시아의 "
+                "교류를 보여주는 대표 유물입니다 (출처: 국가유산청 국가유산포털).\n"
+                "- 1973년 경주 황남동 계림로 14호분에서 발굴되었으며, 길이 36cm로 금·가넷·마노 등으로 "
+                "장식되어 있습니다.\n"
+                "- 삼국시대에 흔했던 환두대도와는 형태·문양이 전혀 달라, 한반도가 아닌 서역에서 만들어진 "
+                "검으로 확인됩니다. 장식에 쓰인 석류석은 동유럽산이며, 문양도 불가리아 트라키아 시대 "
+                "유물과 유사합니다.\n"
+                "- 현재 국립경주박물관에 소장되어 있으며, 신라 문화의 국제적 성격을 보여주는 대표 "
+                "유물로 평가됩니다."
+            ),
+        },
+        {
+            "doc_id": "intl-wonseong-tomb-statue",
+            "title": "경주 원성왕릉(괘릉) 무인상: 서역인 모습의 석상",
+            "category": "역사·국제교류",
+            "text": (
+                "경주 원성왕릉(통일신라 제38대 원성왕의 무덤, 흔히 '괘릉'이라 불림)에는 이국적인 "
+                "외모의 무인상이 세워져 있어 실제로 방문해서 볼 수 있는 국제교류의 흔적입니다 "
+                "(출처: 국가유산청 국가유산포털).\n"
+                "- 무덤 입구 좌우에 문인상·무인상·사자상·석주가 배치되어 있는데, 이 중 무인상 한 쌍은 "
+                "깊은 눈, 넓은 코, 숱 많은 수염 등 서역인의 얼굴 특징을 사실적으로 표현하고 있습니다.\n"
+                "- 학계에서는 무역을 위해 신라에 왔다가 정착한 서역인을 모델로 했을 것으로 추정하며, "
+                "통일신라시대 동서 문화 교류를 보여주는 중요한 자료로 평가합니다.\n"
+                "- 보물로 지정되어 있으며, 경주 시내에서 불국사 방향으로 가는 길에 위치합니다."
+            ),
+        },
+        {
+            "doc_id": "intl-cheoyong-theory",
+            "title": "처용 설화와 서역인설 (학계 이견 있음)",
+            "category": "역사·국제교류",
+            "text": (
+                "경주·울산 지역에 전해지는 처용 설화를 둘러싸고 처용을 아랍·페르시아계 서역인으로 "
+                "보는 학설이 있지만, 학계에서 정설로 합의된 내용은 아니므로 사실처럼 단정해서 안내하지 "
+                "않아야 합니다 (출처: 한국연구재단 학술논문, 언론 칼럼).\n"
+                "- 처용의 정체에 대해서는 지방 호족의 아들이라는 설, 아랍·페르시아계 서역인이라는 설 "
+                "등 여러 해석이 있습니다.\n"
+                "- 아랍상인설을 주장하는 쪽은 처용 설화의 배경인 울산 개운포가 통일신라 시기 국제 "
+                "무역항이었다는 점을 근거로 듭니다.\n"
+                "- 다만 신라·고려·조선을 통틀어 처용을 아랍인이라고 명시한 기록은 없어, 이 학설에 "
+                "대한 학계의 반론도 있습니다. 질문에 답할 때는 '~라는 설이 있다'는 식으로 안내하고, "
+                "확정된 사실처럼 말하지 않아야 합니다."
+            ),
+        },
+        {
+            "doc_id": "intl-temple-etiquette-detail",
+            "title": "한국 사찰 참배 예절 상세 안내 (외국인 방문객용)",
+            "category": "예절",
+            "text": (
+                "종교와 국적에 관계없이 한국 사찰을 방문하는 모든 사람에게 적용되는 참배 예절입니다 "
+                "(출처: 대한불교조계종 관련 안내, 국내 여행 매체).\n"
+                "- 법당 등 실내에 들어갈 때는 신발을 벗습니다.\n"
+                "- 불상 앞에서 예를 표할 때는 두 손을 모아 합장합니다. 절(1배 또는 3배)을 하는 경우가 "
+                "많지만, 참배자가 아니라면 절을 하지 않고 가볍게 목례만 해도 실례가 아닙니다. 무릎을 "
+                "꿇기 어려우면 합장 후 허리를 숙이는 반절로 대신할 수 있습니다.\n"
+                "- 사진 촬영은 반드시 허용 여부를 먼저 확인하세요. 예불 중인 스님이나 참배객, 불상을 "
+                "인물 사진 찍듯 촬영하는 것은 무례하게 받아들여질 수 있습니다.\n"
+                "- 실내에서는 모자와 선글라스를 벗는 것이 예의입니다.\n"
+                "- 사찰 내에서는 음주와 흡연이 금지됩니다. 육류나 마늘·파 등 냄새가 강한 음식(오신채)을 "
+                "가지고 들어가는 것도 삼가야 합니다.\n"
+                "- 노출이 심한 복장보다는 무릎과 어깨를 가리는 단정한 복장을 권장합니다(한국 사찰은 "
+                "동남아 일부 국가처럼 복장을 엄격히 통제하지는 않지만, 단정한 차림이 예의로 여겨집니다)."
+            ),
+        },
+        {
+            "doc_id": "intl-tourist-info-center",
+            "title": "경주 외국인 관광안내소 및 다국어 해설 안내",
+            "category": "실용정보",
+            "text": (
+                "경주에는 외국어 통역이 가능한 관광안내소와 다국어 문화관광해설사가 있습니다 (출처: "
+                "경주문화관광 공식 홈페이지 gyeongju.go.kr/tour).\n"
+                "- 불국사 관광안내소: 054-746-4747\n"
+                "- 경주 터미널 관광안내소: 054-772-9289\n"
+                "- 서라벌 관광안내소: 054-777-1330\n"
+                "- 경주역 관광안내소: 054-771-1336\n"
+                "- 문화관광해설사는 한국어 외에 영어·일본어·중국어 해설이 가능하며, 대릉원·분황사· "
+                "불국사·동궁과 월지·양동마을·첨성대·석굴암 등 주요 유적지에 외국어 해설사가 배치되어 "
+                "있습니다. 이용을 원하면 해당 관광지 안내소나 경주문화관광 홈페이지에서 사전 신청할 "
+                "수 있습니다."
+            ),
+        },
+        {
+            "doc_id": "intl-practical-info",
+            "title": "경주 여행 실용정보: 유심·환전·교통",
+            "category": "실용정보",
+            "text": (
+                "경주를 방문하는 외국인 여행자가 자주 묻는 실용정보입니다.\n"
+                "- 유심(SIM)·이심(eSIM): 인천공항 등에서 사전 구매해 오거나 국내 통신사 대리점에서 "
+                "구매할 수 있습니다. 경주 시내에는 공항만큼 다양한 선택지가 없을 수 있어, 되도록 "
+                "방문 전에 준비하는 것을 권장합니다.\n"
+                "- 환전: 해외에서 발급된 카드로 출금 가능한 Global ATM을 이용하면 별도 환전 없이도 "
+                "현금을 인출할 수 있습니다. 교통카드 충전, 전통시장, 일부 소규모 식당에서는 현금이 "
+                "필요할 수 있습니다.\n"
+                "- 교통카드: 시내버스 이용 시 교통카드(T-money 등)를 사용하면 편리하며, 편의점에서 "
+                "구매·충전할 수 있습니다.\n"
+                "- 공공 와이파이: 경주문화관광 홈페이지 안내에 따르면 주요 관광지에서 공공 와이파이 "
+                "서비스를 제공합니다."
+            ),
+        },
+        {
+            "doc_id": "intl-food-dietary",
+            "title": "경주 여행 중 채식·할랄 등 식단 안내",
+            "category": "실용정보",
+            "text": (
+                "경주 내 할랄 인증 음식점이나 채식 전문 식당에 대한 구체적이고 최신인 목록은 이 "
+                "챗봇의 자료로는 확인되지 않습니다. 정직하게 안내하면 다음과 같습니다.\n"
+                "- 특정 식당이 할랄 인증을 받았는지, 채식 메뉴가 있는지는 방문 전 해당 식당에 직접 "
+                "문의하거나 예약 시 요청하는 것이 가장 확실합니다.\n"
+                "- 한국관광공사는 무슬림 여행자를 위한 안내 자료를 별도로 운영하고 있어, 대도시 기준 "
+                "정보를 참고할 수 있습니다. 다만 경주처럼 상대적으로 작은 관광도시는 대도시보다 "
+                "선택지가 제한적일 수 있습니다.\n"
+                "- 알레르기나 특정 식이 제한이 있다면 식당 방문 시 사전에 명확히 전달하는 것을 "
+                "권장합니다.\n"
+                "이 항목은 정보가 부족한 채로 남겨두는 것이 추측성 안내보다 안전하다고 판단해 이렇게 "
+                "정리했습니다."
+            ),
+        },
+    )
+
+    # 경주에는 비슷하게 생긴 왕릉·고분이 많아 "이건 누구 무덤이냐"는 질문이 자주 나온다.
+    # 관광지별 overview는 길고 백과사전식이라 짧은 식별 질문에는 오히려 잘 안 맞는 경우가
+    # 있어서, 핵심 인물·시대·특징만 짧게 정리한 문서를 따로 둔다. 전설/설화는 역사적 사실과
+    # 구분해서 "~라는 전설이 있다"는 식으로만 적는다. 전부 국가유산청·한국민족문화대백과·
+    # 위키백과 등 공개 자료 기준으로 정리했다 (2026년 9월 확인).
+    LANDMARK_HISTORY_DOCUMENTS = (
+        {
+            "doc_id": "history-oreung",
+            "title": "경주 오릉: 신라 시조 박혁거세의 무덤",
+            "category": "역사·정체성",
+            "text": (
+                "경주 오릉은 신라를 세운 시조 박혁거세 거서간(재위 기원전 57~서기 4)과 왕비 "
+                "알영부인, 그리고 남해 차차웅·유리 이사금·파사 이사금 등 초기 박씨 왕들의 무덤으로 "
+                "전해집니다. 봉토무덤 4기와 원형무덤 1기로 이루어져 있으며, 사적으로 지정되어 "
+                "있습니다. 동쪽에는 시조의 위패를 모신 숭덕전이, 그 뒤로는 왕비 탄생 설화와 관련된 "
+                "알영정이 있습니다."
+            ),
+        },
+        {
+            "doc_id": "history-muyeol-tomb",
+            "title": "경주 태종무열왕릉: 삼국통일 기초를 놓은 무열왕",
+            "category": "역사·정체성",
+            "text": (
+                "태종무열왕릉은 신라 제29대 무열왕(김춘추, 재위 654~661)의 무덤입니다. 무열왕은 "
+                "당나라와 연합해 백제를 정복하며 삼국통일의 기초를 놓았고, 실제 통일은 아들인 "
+                "문무왕 때 고구려를 멸망시키며 완성되었습니다. 무덤 앞에는 국보로 지정된 "
+                "태종무열왕릉비가 있는데, 거북 모양 받침돌과 용 모양 머릿돌로 장식되어 당나라의 "
+                "영향을 보여줍니다. 무덤은 경주 서악동, 첨성대에서 서쪽으로 이동하면 있는 서악동 "
+                "고분군 바로 앞에 있습니다."
+            ),
+        },
+        {
+            "doc_id": "history-heungdeok-tomb",
+            "title": "경주 흥덕왕릉: 청해진을 세운 흥덕왕",
+            "category": "역사·정체성",
+            "text": (
+                "흥덕왕릉은 신라 제42대 흥덕왕(본명 김수종)의 무덤으로, 경주 안강읍에 있습니다. "
+                "흥덕왕은 장보고를 시켜 완도에 청해진을 설치해 서해를 방어하게 했고, 당에서 가져온 "
+                "차 종자를 지리산에 심어 재배하도록 한 것으로 유명합니다. 봉토 둘레돌에 십이지신상을 "
+                "새겼고, 무덤을 지키는 무인석상은 원성왕릉(괘릉)의 무인상과 마찬가지로 서역인의 "
+                "얼굴을 하고 있습니다."
+            ),
+        },
+        {
+            "doc_id": "history-jindeok-tomb",
+            "title": "경주 진덕여왕릉: 신라의 마지막 성골 여왕",
+            "category": "역사·정체성",
+            "text": (
+                "진덕여왕릉은 신라 제28대 진덕여왕(재위 647~654)의 무덤입니다. 본명은 승만이며, "
+                "선덕여왕의 사촌동생이자 신라의 두 번째 여왕이고, 성골 신분으로는 마지막 왕입니다. "
+                "김춘추(훗날 무열왕)와 김유신의 도움으로 왕위에 올라 관료·군사 조직을 정비하고 당의 "
+                "제도를 적극 받아들였습니다. 무덤 둘레돌에는 갑옷을 입고 무기를 든 십이지신상이 "
+                "새겨져 있습니다."
+            ),
+        },
+        {
+            "doc_id": "history-kimyusin",
+            "title": "경주 김유신묘: 흥무대왕으로 추봉된 통일 공신",
+            "category": "역사·정체성",
+            "text": (
+                "김유신묘는 신라의 삼국통일에 중심 역할을 한 김유신(595~673) 장군의 무덤으로 "
+                "전해집니다. 김유신은 660년 백제를, 668년 고구려를 정벌하는 데 앞장섰고, 훗날 "
+                "흥덕왕 때 왕이 아니었음에도 '흥무대왕'으로 추봉되었습니다. 무덤 둘레돌에는 십이지 "
+                "신상을 새긴 버팀돌이 일정한 간격으로 배치되어 있는데, 이런 십이지신상 무덤 양식은 "
+                "통일신라 이후 성덕왕릉에서 시작된 것으로 봅니다."
+            ),
+        },
+        {
+            "doc_id": "history-seoak-tombs",
+            "title": "경주 서악동 고분군: 무열왕릉 뒤편의 대형 무덤들",
+            "category": "역사·정체성",
+            "text": (
+                "서악동 고분군은 태종무열왕릉 바로 뒤편 구릉에 분포하는 4개의 대형 무덤을 가리키며, "
+                "사적으로 지정되어 있습니다. 무열왕릉과 함께 둘러보기 좋은 위치에 있어, 신라 초기 "
+                "왕릉의 규모와 형태를 함께 살펴볼 수 있는 곳으로 꼽힙니다."
+            ),
+        },
+        {
+            "doc_id": "history-seongdeok-tomb",
+            "title": "경주 성덕왕릉: 신라 전성기를 이끈 성덕왕",
+            "category": "역사·정체성",
+            "text": (
+                "성덕왕릉은 신라 제33대 성덕왕(재위 701~737)의 무덤으로, 경주에서 불국사 방향으로 "
+                "가는 길의 동남쪽 소나무숲 속에 있습니다. 성덕왕은 당나라와 활발히 교류하며 정치적 "
+                "으로 가장 안정된 신라의 전성기를 이끈 왕으로 평가받습니다. 무덤 둘레에 십이지신상을 "
+                "새긴 양식이 이 왕릉에서 처음 시작된 것으로 봅니다."
+            ),
+        },
+        {
+            "doc_id": "history-gyeongdeok-tomb",
+            "title": "경주 경덕왕릉: 불국사를 완성한 경덕왕",
+            "category": "역사·정체성",
+            "text": (
+                "경덕왕릉은 신라 제35대 경덕왕(이름 헌영, 성덕왕의 아들)의 무덤이라 전해집니다. "
+                "경덕왕 10년(751년)에 불국사가 완공되었고, 당과도 활발히 교역하며 신라의 전성기를 "
+                "이어갔습니다. 경주 시가지에서 서남쪽으로 떨어진 구릉에 자리하고 있습니다."
+            ),
+        },
+        {
+            "doc_id": "history-hwangnyongsa",
+            "title": "경주 황룡사지: 몽골 침입으로 사라진 9층 목탑",
+            "category": "역사·정체성",
+            "text": (
+                "황룡사지는 신라 최대 규모였던 사찰 황룡사의 터입니다. 553년(진흥왕 14년) 공사를 "
+                "시작해 645년(선덕여왕 14년) 9층 목탑이 완성되었고, 이후 약 600년간 경주의 랜드마크 "
+                "역할을 했습니다. 하지만 1238년(고려 고종 25년) 몽골의 3차 침입으로 불타 없어진 "
+                "뒤로는 다시 세워지지 못했고, 지금은 터와 초석만 남아 있습니다."
+            ),
+        },
+        {
+            "doc_id": "history-gameunsa",
+            "title": "경주 감은사지: 문무왕의 호국룡 설화",
+            "category": "역사·정체성",
+            "text": (
+                "감은사지는 문무왕이 삼국통일 이후 왜의 침입을 막기 위해 짓기 시작한 절터로, 아들 "
+                "신문왕 때인 682년에 완공되었습니다. 문무왕은 죽으면서 '죽은 뒤 나라를 지키는 용이 "
+                "되어 불법을 받들고 나라를 지키겠다'는 유언을 남겼다고 전해지며, 화장한 유골은 동해 "
+                "대왕암에 모셔졌다는 설화가 있습니다. 금당 아래에 용이 드나들 수 있도록 구멍을 낸 "
+                "구조가 남아 있어, 이 설화를 건축적으로 구현한 사례로 이야기됩니다."
+            ),
+        },
+        {
+            "doc_id": "history-gyerim-forest",
+            "title": "경주 계림: 김알지 탄생 설화와 신라 김씨의 시작",
+            "category": "역사·정체성",
+            "text": (
+                "계림은 경주 김씨의 시조 김알지가 태어났다고 전해지는 숲입니다. 삼국사기에 따르면 "
+                "탈해왕 9년(65년), 숲속 나무에 걸린 금궤에서 흰 닭이 울고 그 안에서 사내아이가 "
+                "나왔다는 설화가 전합니다. 금궤에서 나왔다 해서 성을 '김'이라 했고, 이때부터 이 "
+                "숲을 '계림'이라 부르며 한때 나라 이름으로도 쓰였습니다. 김알지의 6대손 미추가 "
+                "김씨 최초로 신라 왕이 되었습니다."
+            ),
+        },
+        {
+            "doc_id": "history-poseokjeong",
+            "title": "경주 포석정: 신라 왕실 연회 장소이자 경애왕의 비극",
+            "category": "역사·정체성",
+            "text": (
+                "포석정은 신라 왕실의 별궁으로, 제49대 헌강왕(875~885) 무렵 조성된 것으로 봅니다. "
+                "중국 왕희지의 유상곡수연(물 위에 술잔을 띄워 시를 짓는 연회)을 본떠 만든 곳으로 "
+                "알려져 있습니다. 삼국사기에 따르면 경애왕 4년(927년) 11월, 왕이 이곳에서 연회를 "
+                "벌이던 중 후백제 견훤의 기습을 받아 왕이 죽고 왕비와 신하들도 해를 입었다는 기록이 "
+                "있습니다."
+            ),
+        },
+        {
+            "doc_id": "history-kimdaeseong",
+            "title": "불국사·석굴암 창건 설화: 김대성의 두 부모 이야기",
+            "category": "역사·정체성",
+            "text": (
+                "불국사와 석굴암의 창건에는 김대성의 설화가 전해집니다 (삼국유사 '대성효이세부모' "
+                "조). 751년(경덕왕 10년) 김대성이 전생의 부모를 위해 석굴암을, 현생의 부모를 위해 "
+                "불국사를 짓기 시작했다고 전합니다. 설화에 따르면 가난한 집 아들이었던 대성이 시주 "
+                "공덕으로 부잣집 아들로 다시 태어났다고 합니다. 774년 김대성이 완성을 보지 못하고 "
+                "세상을 떠나자, 나라에서 불국사 공사를 마무리했습니다."
+            ),
+        },
+        {
+            "doc_id": "history-seongdeok-bell",
+            "title": "성덕대왕신종(에밀레종): 전설과 실제 역사 구분",
+            "category": "역사·정체성",
+            "text": (
+                "국립경주박물관에 있는 성덕대왕신종은 국보로 지정된 신라의 대표 범종입니다. 경덕왕이 "
+                "아버지 성덕왕의 공덕을 기리기 위해 종을 만들려다 뜻을 이루지 못했고, 그 아들 "
+                "혜공왕이 771년에 완성했습니다. 아기를 시주해 넣었다는 '에밀레종' 전설로 널리 "
+                "알려져 있지만, 이는 전설일 뿐 역사적 사실로 확인되지 않습니다. 실제 기록상 이 종은 "
+                "본래 봉덕사에 걸렸다가 절이 폐사된 뒤 영묘사로 옮겨졌고, 조선시대에는 경주읍성 "
+                "남문 밖에서 성문 개폐 시간을 알리는 종으로 쓰였습니다."
+            ),
+        },
+        {
+            "doc_id": "history-jureonggu",
+            "title": "주령구: 동궁과 월지에서 나온 신라 시대 놀이 주사위",
+            "category": "역사·정체성",
+            "text": (
+                "주령구는 정사각형 면 6개와 정육각형 면 8개로 이루어진 14면체 나무 주사위로, 1975년 "
+                "동궁과 월지(당시 안압지) 발굴 중 출토되었습니다. 각 면에는 술자리에서 걸리면 해야 "
+                "하는 다양한 벌칙이 적혀 있어, 신라인들의 풍류와 음주 문화를 보여주는 유물로 꼽힙니다. "
+                "안타깝게도 출토된 진품은 보존 처리 도중 불에 타 없어졌고, 지금은 복제품만 남아 "
+                "있습니다."
+            ),
+        },
+        {
+            "doc_id": "history-cheomseongdae-debate",
+            "title": "첨성대의 용도 논쟁: 정설로 합의되지 않음",
+            "category": "역사·정체성",
+            "text": (
+                "첨성대의 정확한 용도는 학계에서 아직 정설로 합의되지 않았으며, 여러 학설이 "
+                "제기됩니다. 1970년대까지는 천문대라는 데 별다른 이견이 없었지만, 이후 구조적으로 "
+                "천문 관측에 적합하지 않다는 지적이 나오며 다양한 학설이 제기되었습니다.\n"
+                "- 천문대설: 삼국유사에 '별을 바라보는 곳'이라 적힌 데 근거합니다.\n"
+                "- 지점 정렬설: 선덕여왕릉과 함께 동지 일출선에 맞춰 배치되었다는 점에 근거합니다.\n"
+                "- 우물설: 생김새가 우물과 닮았다는 점에 근거합니다.\n"
+                "- 상징물설·제천단설: 실제 관측 도구가 아니라 당대 수학·천문 지식을 반영한 상징적 "
+                "구조물, 또는 불교의 수미산을 형상화한 제단이라는 주장입니다.\n"
+                "질문에 답할 때는 '~라는 학설이 있다'는 식으로 안내하고, 특정 학설을 정답처럼 "
+                "단정하지 않아야 합니다."
+            ),
+        },
+    )
+
+    # 왕릉·고분은 종교시설과는 다른 방식으로 존중해야 할 대상이라, 사찰 예절과 별도로 문서를
+    # 둔다. 봉분(무덤 자체)에 올라가는 관광객이 실제로 자주 있어 안내가 필요하다.
+    TOMB_ETIQUETTE_DOCUMENTS = (
+        {
+            "doc_id": "etiquette-tomb",
+            "title": "경주 왕릉·고분 방문 예절",
+            "category": "예절",
+            "text": (
+                "경주의 왕릉과 고분(대릉원, 오릉, 김유신묘, 각 왕릉 등)은 실제 무덤이므로 사찰과는 "
+                "다른 방식의 예절이 필요합니다.\n"
+                "- 봉분(둥근 무덤 자체) 위에 올라가거나 앉지 마세요. 잔디가 덮여 있어 언덕처럼 "
+                "보이지만 실제로는 무덤입니다.\n"
+                "- 둘레돌, 십이지신상, 문인석·무인석 등 석물을 만지거나 그 위에 올라가지 마세요.\n"
+                "- 정해진 관람로를 벗어나 봉분 사이로 가로질러 다니지 마세요.\n"
+                "- 다른 문화재와 마찬가지로 큰 소리를 내지 않고, 지정된 곳 외에서는 음식물 섭취를 "
+                "삼가는 것이 좋습니다."
+            ),
+        },
+    )
+
+    async def _sync_etiquette_documents(self) -> int:
+        if not self.settings.openai_api_key:
+            return 0
+
+        all_documents = (
+            self.ETIQUETTE_DOCUMENTS
+            + self.ACCESSIBILITY_DOCUMENTS
+            + self.INTERNATIONAL_VISITOR_DOCUMENTS
+            + self.LANDMARK_HISTORY_DOCUMENTS
+            + self.TOMB_ETIQUETTE_DOCUMENTS
+        )
+        texts = [f"{doc['title']}\n{doc['category']}\n{doc['text']}" for doc in all_documents]
+        embeddings = await self.openai.embeddings(texts)
+
+        for doc, embedding in zip(all_documents, embeddings, strict=False):
+            record = self.db.get(KnowledgeDocument, doc["doc_id"])
+            if record:
+                record.title = doc["title"]
+                record.category = doc["category"]
+                record.text = doc["text"]
+                record.embedding = embedding
+                record.updated_at = datetime.now(timezone.utc)
+            else:
+                self.db.add(
+                    KnowledgeDocument(
+                        doc_id=doc["doc_id"],
+                        title=doc["title"],
+                        category=doc["category"],
+                        text=doc["text"],
+                        embedding=embedding,
+                    )
+                )
+
+        return len(all_documents)
+
     async def sync(
         self,
     ) -> SyncResponse:
@@ -6253,6 +6997,8 @@ class SyncService:
 
             stored += 1
 
+        embedded_docs = await self._sync_etiquette_documents()
+
         self.db.commit()
 
         return SyncResponse(
@@ -6262,7 +7008,7 @@ class SyncService:
                 1
                 for item in embeddings
                 if item
-            ),
+            ) + embedded_docs,
             started_at=started,
             completed_at=datetime.now(
                 timezone.utc
@@ -6393,94 +7139,119 @@ class RagService:
         self,
         query: str,
         top_k: int,
+        history: list[ChatTurn] | None = None,
     ) -> RagSearchResponse:
+        history = history or []
+
+        # "그거 주차는 되나요?" 같은 후속 질문은 현재 질문만 임베딩하면 어떤 장소를
+        # 말하는지 검색이 못 잡는다. 직전 사용자 발화를 붙여서 검색용 텍스트를
+        # 만들되, 화면/응답에 쓰는 query 자체는 원래 질문 그대로 둔다.
+        last_user_turn = next(
+            (turn.content for turn in reversed(history) if turn.role == "user"),
+            None,
+        )
+        search_text = f"{last_user_turn}\n{query}" if last_user_turn else query
+
         vector = (
             await self.openai.embeddings(
-                [query]
+                [search_text]
             )
         )[0]
 
-        records = self.db.scalars(
-            select(
-                PlaceRecord
-            ).where(
-                PlaceRecord.embedding.is_not(
-                    None
-                )
-            )
+        place_records = self.db.scalars(
+            select(PlaceRecord).where(PlaceRecord.embedding.is_not(None))
+        ).all()
+        doc_records = self.db.scalars(
+            select(KnowledgeDocument).where(KnowledgeDocument.embedding.is_not(None))
         ).all()
 
-        if not records:
+        if not place_records and not doc_records:
             raise ValueError(
                 "RAG 인덱스가 없습니다. "
                 "먼저 POST /api/v1/admin/sync를 실행하세요."
             )
 
-        scored: list[
-            tuple[
-                float,
-                PlaceRecord,
-            ]
-        ] = []
-
-        for record in records:
-            similarity = _cosine(
-                vector,
-                record.embedding or [],
-            )
-
-            scored.append(
-                (
-                    similarity,
-                    record,
-                )
-            )
-
-        scored.sort(
-            key=lambda item:
-            item[0],
+        place_scored = sorted(
+            ((_cosine(vector, record.embedding or []), "place", record) for record in place_records),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        doc_scored = sorted(
+            ((_cosine(vector, record.embedding or []), "etiquette", record) for record in doc_records),
+            key=lambda item: item[0],
             reverse=True,
         )
 
-        selected = scored[
-            :top_k
-        ]
+        # 관광지(300여 건)와 지식 문서(에티켓/접근성, 10여 건)를 한 풀에서 top-k로
+        # 경쟁시키면 지식 문서가 항상 밀려나 답변에 반영되지 못한다. 그래서 관광지는
+        # top-k만 뽑되, 지식 문서는 개수가 적으니 전부 포함해 둔다. 문서 문구가 서로
+        # 비슷해(예: 관광지별 접근성 안내) 임베딩 유사도만으로는 정확한 장소를 놓칠 수
+        # 있어서, 개수가 많지 않은 지금은 순위 대신 전부 넘기고 LLM이 관련된 것만
+        # 골라 쓰게 한다. 문서가 크게 늘어나면 다시 상위 N개로 제한하는 게 맞다.
+        selected = sorted(
+            place_scored[:top_k] + doc_scored,
+            key=lambda item: item[0],
+            reverse=True,
+        )
 
-        hits = [
-            RagHit(
-                place_id=record.place_id,
-                title=record.title,
-                category=record.category,
-                similarity=round(
-                    score,
-                    4,
-                ),
-                overview=(
-                    record.data
-                    or {}
-                ).get(
-                    "overview"
-                ),
-                address=(
-                    record.data
-                    or {}
-                ).get(
-                    "address"
-                ),
+        if not selected or selected[0][0] < self.settings.rag_min_similarity:
+            return RagSearchResponse(
+                query=query,
+                answer="질문과 관련해 확인할 수 있는 자료가 부족합니다. 관광지명을 함께 알려주시면 다시 찾아볼게요.",
+                hits=[],
+                grounded=False,
             )
-            for score, record
-            in selected
-        ]
 
-        contexts = [
-            record.data
-            for _, record
-            in selected
-        ]
+        # LLM에는 selected(관광지 top-k + 지식 문서 전체)를 다 보여줘 정확한 장소를
+        # 놓치지 않게 하되, 화면에는 실제로 유사도가 높은 상위 항목만 "참고한 자료"로
+        # 보여준다 — 매번 지식 문서 10여 개가 전부 칩으로 뜨면 오히려 혼란스럽다.
+        display_pool = selected[:top_k]
+
+        contexts: list[dict] = []
+        for score, source_type, record in selected:
+            if source_type == "place":
+                contexts.append(record.data or {})
+            else:
+                contexts.append({"title": record.title, "category": record.category, "overview": record.text})
+
+        hits: list[RagHit] = []
+        for score, source_type, record in display_pool:
+            if source_type == "place":
+                data = record.data or {}
+                hits.append(
+                    RagHit(
+                        source_type="place",
+                        place_id=record.place_id,
+                        title=record.title,
+                        category=record.category,
+                        similarity=round(score, 4),
+                        overview=data.get("overview"),
+                        address=data.get("address"),
+                        operating_hours=data.get("operating_hours"),
+                        rest_date=data.get("rest_date"),
+                        fee_text=data.get("fee_text"),
+                        parking=data.get("parking"),
+                        stroller_info=data.get("stroller_info"),
+                        pet_info=data.get("pet_info"),
+                        homepage=data.get("homepage"),
+                    )
+                )
+            else:
+                hits.append(
+                    RagHit(
+                        source_type="etiquette",
+                        place_id=record.doc_id,
+                        title=record.title,
+                        category=record.category,
+                        similarity=round(score, 4),
+                        overview=record.text,
+                    )
+                )
 
         answer = await self.openai.answer_with_context(
             query,
             contexts,
+            history=history,
         )
 
         return RagSearchResponse(

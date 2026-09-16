@@ -25,6 +25,16 @@ class PlaceRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class KnowledgeDocument(Base):
+    __tablename__ = "knowledge_documents"
+    doc_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    title: Mapped[str] = mapped_column(String(255), index=True)
+    category: Mapped[str] = mapped_column(String(100), default="지식")
+    text: Mapped[str] = mapped_column(String)
+    embedding: Mapped[list[float] | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class JourneyRecord(Base):
     __tablename__ = "journeys"
     journey_id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: str(uuid4()))
@@ -393,6 +403,26 @@ class CommunityCommentRecord(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class CommunityPostReportRecord(Base):
+    __tablename__ = "community_post_reports"
+
+    report_key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    post_id: Mapped[str] = mapped_column(String(36), ForeignKey("community_posts.post_id", ondelete="CASCADE"), index=True)
+    reporter_user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.user_id", ondelete="CASCADE"), index=True)
+    reason: Mapped[str] = mapped_column(String(40))
+    detail: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class CommunityPostHiddenRecord(Base):
+    __tablename__ = "community_post_hidden"
+
+    hide_key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    post_id: Mapped[str] = mapped_column(String(36), ForeignKey("community_posts.post_id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.user_id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
 class CommunitySavedCourseRecord(Base):

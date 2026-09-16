@@ -102,6 +102,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-5-mini"
     openai_embedding_model: str = "text-embedding-3-small"
     openai_base_url: str = "https://api.openai.com/v1"
+    rag_min_similarity: float = 0.15
 
     # -------------------------------------------------------------------------
     # Naver / YouTube

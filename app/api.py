@@ -733,6 +733,7 @@ async def rag_search(
         ).search(
             body.query,
             body.top_k,
+            history=body.history,
         )
 
     except IntegrationError as exc:

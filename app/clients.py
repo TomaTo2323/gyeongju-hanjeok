@@ -12,7 +12,7 @@ import httpx
 
 from .config import Settings
 from .geo import latest_ultra_short_base, latlon_to_kma_grid
-from .schemas import ContentItem, Place, TransportMode
+from .schemas import ChatTurn, ContentItem, Place, TransportMode
 
 
 class IntegrationError(RuntimeError):
@@ -244,15 +244,44 @@ class BaseClient:
         except (httpx.HTTPError, ValueError) as exc:
             raise IntegrationError(service, str(exc)) from exc
 
-    async def _post(self, service: str, url: str, *, json_body: dict[str, Any], headers: dict[str, str] | None = None) -> dict[str, Any]:
+    async def _post(
+        self,
+        service: str,
+        url: str,
+        *,
+        json_body: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                response = await client.post(url, json=json_body, headers=headers)
+            timeout = (
+                httpx.Timeout(timeout_seconds)
+                if timeout_seconds is not None
+                else self.timeout
+            )
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+            ) as client:
+                response = await client.post(
+                    url,
+                    json=json_body,
+                    headers=headers,
+                )
                 response.raise_for_status()
                 return response.json()
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:500]
-            raise IntegrationError(service, f"HTTP {exc.response.status_code}: {body}", status_code=exc.response.status_code) from exc
+            raise IntegrationError(
+                service,
+                f"HTTP {exc.response.status_code}: {body}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise IntegrationError(
+                service,
+                f"요청 시간이 초과되었습니다. ({timeout_seconds or self.settings.http_timeout_seconds}초)",
+            ) from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise IntegrationError(service, str(exc)) from exc
 
@@ -317,17 +346,14 @@ class TourApiClient(BaseClient):
 
     async def gyeongju_places(
         self,
-        limit: int = 500,
+        limit: int = 1000,
     ) -> list[Place]:
         """
-        경주시 관광지 전체 후보.
+        경주시 관광지 전체 후보를 수집합니다.
 
-        areaBasedList2가 numOfRows를 크게 줘도 환경에 따라
-        실제 한 페이지 응답 수가 제한되는 경우가 있어 100개 단위로
-        명시적으로 페이지를 넘깁니다.
-
-        이 수정은 불국사처럼 첫 페이지에 없던 대표 관광지가
-        전체 후보 풀에서 누락되는 문제를 막습니다.
+        KorService2의 기존 지역코드(areaCode/sigunguCode)와
+        법정동 코드(lDongRegnCd/lDongSignguCd)를 모두 조회한 뒤
+        contentid(place_id)를 기준으로 중복을 제거합니다.
         """
         wanted = max(
             1,
@@ -338,99 +364,109 @@ class TourApiClient(BaseClient):
         )
         rows = 100
 
-        async def page(
-            page_no: int,
-        ) -> dict[str, Any]:
-            params = self._auth_params() | {
-                "areaCode":
-                    self.settings.tour_area_code,
-                "sigunguCode":
-                    self.settings.tour_sigungu_code,
-                "arrange": "C",
-                "numOfRows": rows,
-                "pageNo": page_no,
-            }
+        async def fetch_group(
+            region_params: dict[str, str],
+        ) -> list[dict[str, Any]]:
+            async def page(
+                page_no: int,
+            ) -> dict[str, Any]:
+                params = self._auth_params() | region_params | {
+                    "arrange": "C",
+                    "numOfRows": rows,
+                    "pageNo": page_no,
+                }
 
-            return await self._get(
-                "tour_api",
-                (
-                    f"{self.settings.tour_api_base_url}"
-                    "/areaBasedList2"
-                ),
-                params=params,
-            )
-
-        first = await page(1)
-        first_items = _items(first)
-
-        try:
-            total_count = int(
-                first["response"]["body"].get(
-                    "totalCount",
-                    len(first_items),
+                return await self._get(
+                    "tour_api",
+                    (
+                        f"{self.settings.tour_api_base_url}"
+                        "/areaBasedList2"
+                    ),
+                    params=params,
                 )
-            )
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-        ):
-            total_count = len(
-                first_items
-            )
 
-        max_pages = max(
-            1,
-            min(
-                (wanted + rows - 1) // rows,
+            first = await page(1)
+            first_items = _items(first)
+
+            try:
+                total_count = int(
+                    first["response"]["body"].get(
+                        "totalCount",
+                        len(first_items),
+                    )
+                )
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+                total_count = len(first_items)
+
+            max_pages = max(
+                1,
                 (total_count + rows - 1) // rows
                 if total_count > 0
                 else 1,
-            ),
-        )
+            )
 
-        payloads = [first]
+            payloads = [first]
 
-        if max_pages > 1:
-            payloads.extend(
-                await asyncio.gather(
-                    *(
-                        page(page_no)
-                        for page_no
-                        in range(
-                            2,
-                            max_pages + 1,
+            if max_pages > 1:
+                payloads.extend(
+                    await asyncio.gather(
+                        *(
+                            page(page_no)
+                            for page_no in range(
+                                2,
+                                max_pages + 1,
+                            )
                         )
                     )
                 )
-            )
+
+            items: list[dict[str, Any]] = []
+
+            for payload in payloads:
+                items.extend(_items(payload))
+
+            return items
+
+        legacy_items, ldong_items = await asyncio.gather(
+            fetch_group(
+                {
+                    "areaCode": str(
+                        self.settings.tour_area_code
+                    ),
+                    "sigunguCode": str(
+                        self.settings.tour_sigungu_code
+                    ),
+                }
+            ),
+            fetch_group(
+                {
+                    "lDongRegnCd": "47",
+                    "lDongSignguCd": "130",
+                }
+            ),
+        )
 
         places: list[Place] = []
         seen: set[str] = set()
 
-        for payload in payloads:
-            for item in _items(
-                payload
+        for item in legacy_items + ldong_items:
+            place = self._place_from_summary(item)
+
+            if (
+                place is None
+                or place.place_id in seen
             ):
-                place = self._place_from_summary(
-                    item
-                )
+                continue
 
-                if (
-                    place is None
-                    or place.place_id in seen
-                ):
-                    continue
+            seen.add(place.place_id)
+            places.append(place)
 
-                seen.add(
-                    place.place_id
-                )
-                places.append(
-                    place
-                )
-
-                if len(places) >= wanted:
-                    return places
+            if len(places) >= wanted:
+                break
 
         return places
 
@@ -2848,19 +2884,80 @@ class OpenAIClient(BaseClient):
         return json.loads(text)
 
 
-    async def answer_with_context(self, query: str, contexts: list[dict[str, Any]]) -> str:
-        context_text = "\n\n".join(
-            f"[{i+1}] {c.get('title')} | {c.get('category')} | {c.get('address') or ''}\n{c.get('overview') or ''}"
-            for i, c in enumerate(contexts)
-        )
+    async def answer_with_context(
+        self,
+        query: str,
+        contexts: list[dict[str, Any]],
+        history: list[ChatTurn] | None = None,
+    ) -> str:
+        def _line(label: str, value: Any) -> str:
+            return f"{label}: {value}" if value else ""
+
+        # 번호([1])가 아니라 자료 제목으로 인용하게 한다. RagService가 LLM에 보여주는
+        # 자료 목록과 화면에 표시하는 "참고한 자료" 칩 목록의 개수/순서가 다를 수 있어서,
+        # 번호로 인용하면 화면의 몇 번째 칩과 실제로 안 맞을 수 있기 때문이다.
+        blocks = []
+        for c in contexts:
+            fields = "\n".join(
+                filter(
+                    None,
+                    [
+                        _line("주소", c.get("address")),
+                        _line("운영시간", c.get("operating_hours")),
+                        _line("휴무일", c.get("rest_date")),
+                        _line("요금", c.get("fee_text")),
+                        _line("주차", c.get("parking")),
+                        _line("유모차", c.get("stroller_info")),
+                        _line("반려동물 동반", c.get("pet_info")),
+                        _line("카드결제", c.get("credit_card_info")),
+                        _line("홈페이지", c.get("homepage")),
+                    ],
+                )
+            )
+            blocks.append(
+                f"[{c.get('title')}] | {c.get('category')}\n"
+                f"{c.get('overview') or ''}\n{fields}"
+            )
+        context_text = "\n\n".join(blocks)
+
+        # 직전 대화(최근 몇 턴)를 그대로 이전 메시지로 끼워 넣는다. 이렇게 하면 "거기 주차는
+        # 되나요?" 같은 후속 질문에서 "거기"가 뭘 가리키는지 모델이 대화 흐름으로 이해할 수 있다.
+        # 근거 자료는 매번 새로 검색한 것만 신뢰하도록, 참고 자료는 항상 마지막 user 메시지에만 붙인다.
+        history_messages = [{"role": turn.role, "content": turn.content} for turn in (history or [])]
+
         body = {
             "model": self.settings.openai_model,
             "input": [
-                {"role": "system", "content": "제공된 한국관광공사 관광지 문맥만 사용해 한국어로 답하세요. 문맥에 없는 사실은 모른다고 밝히고, 추천 장소명과 근거를 간결하게 설명하세요."},
-                {"role": "user", "content": f"질문: {query}\n\n관광지 문맥:\n{context_text}"},
+                {
+                    "role": "system",
+                    "content": (
+                        "당신은 경주 관광 안내 챗봇입니다. 아래 [제목]이 붙은 자료만 근거로 한국어로 답하세요.\n"
+                        "- 자료에 없는 사실은 절대로 지어내지 말고, 그 부분은 확인할 수 없다고 명시하세요.\n"
+                        "- 질문에 답할 만한 자료가 부족하면 억지로 답하지 말고 "
+                        "\"확인할 수 있는 자료가 부족합니다\"라고 답하세요. "
+                        "이때 자료에 홈페이지 주소가 있으면 거기서 확인해보라고 안내하세요.\n"
+                        "- 답변 근거로 사용한 자료는 대괄호 안 제목 그대로 표시하세요 (예: [경주 동궁과 월지]).\n"
+                        "- 특정 국가·인종·종교 집단 전체를 일반화하는 발언은 하지 마세요. 역사적 국제교류는 "
+                        "구체적인 유물·유적 사실로만 설명하고, 학계에서 이견이 있는 내용은 정설처럼 "
+                        "단정하지 말고 자료에 적힌 대로 이견이 있다는 점을 함께 전하세요.\n"
+                        "- 이전 대화가 있다면 '그거', '거기', '거긴' 같은 지시어가 이전 대화의 어떤 "
+                        "관광지·주제를 가리키는지 참고해서 답하세요."
+                    ),
+                },
+                *history_messages,
+                {"role": "user", "content": f"질문: {query}\n\n참고 자료:\n{context_text}"},
             ],
         }
-        payload = await self._post("openai", f"{self.settings.openai_base_url}/responses", json_body=body, headers=self.headers)
+        # RAG 컨텍스트(관광지+지식 문서)가 늘어날수록 모델이 답을 만드는 데 걸리는 시간도
+        # 길어져서, 다른 API 호출에 쓰는 기본 20초 타임아웃으로는 가끔 502가 났다.
+        # 이 호출만 넉넉하게 60초로 늘린다.
+        payload = await self._post(
+            "openai",
+            f"{self.settings.openai_base_url}/responses",
+            json_body=body,
+            headers=self.headers,
+            timeout_seconds=60.0,
+)
         return _extract_openai_text(payload)
 
     async def embeddings(self, texts: list[str]) -> list[list[float]]:

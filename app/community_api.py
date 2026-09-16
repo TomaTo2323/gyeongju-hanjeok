@@ -13,6 +13,8 @@ from .auth_service import get_current_user
 from .db import (
     CommunityCommentRecord,
     CommunityPostRecord,
+    CommunityPostReportRecord,
+    CommunityPostHiddenRecord,
     CommunityRecommendationRecord,
     CommunitySavedCourseRecord,
     JourneyRecord,
@@ -159,6 +161,22 @@ class CommentResponse(BaseModel):
     content: str
     created_at: datetime
     updated_at: datetime
+
+
+class PostReportCreate(BaseModel):
+    reason: Literal["spam", "abuse", "inappropriate", "false_information", "privacy", "other"]
+    detail: str = Field(default="", max_length=500)
+
+
+class PostReportResponse(BaseModel):
+    post_id: str
+    reported: bool
+    reason: str
+
+
+class PostHideResponse(BaseModel):
+    post_id: str
+    hidden: bool
 
 
 class SavedCourseResponse(BaseModel):
@@ -484,7 +502,10 @@ def list_posts(
     current_user: UserRecord = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    filters = []
+    hidden_post_ids = select(CommunityPostHiddenRecord.post_id).where(
+        CommunityPostHiddenRecord.user_id == current_user.user_id
+    )
+    filters = [CommunityPostRecord.post_id.not_in(hidden_post_ids)]
     if post_type is not None:
         filters.append(CommunityPostRecord.post_type == post_type.value)
     if place_id:
@@ -557,6 +578,9 @@ def get_post(
     current_user: UserRecord = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    hidden = db.get(CommunityPostHiddenRecord, f"{post_id}:{current_user.user_id}")
+    if hidden is not None:
+        raise HTTPException(status_code=404, detail="숨긴 게시물입니다.")
     return _response(db, _load_post(db, post_id), current_user.user_id)
 
 
@@ -597,9 +621,47 @@ def delete_post(
     db.execute(delete(CommunityRecommendationRecord).where(CommunityRecommendationRecord.post_id == post_id))
     db.execute(delete(CommunityCommentRecord).where(CommunityCommentRecord.post_id == post_id))
     db.execute(delete(CommunitySavedCourseRecord).where(CommunitySavedCourseRecord.source_post_id == post_id))
+    db.execute(delete(CommunityPostReportRecord).where(CommunityPostReportRecord.post_id == post_id))
+    db.execute(delete(CommunityPostHiddenRecord).where(CommunityPostHiddenRecord.post_id == post_id))
     db.delete(post)
     db.commit()
     return None
+
+
+@community_router.post("/posts/{post_id}/report", response_model=PostReportResponse, status_code=status.HTTP_201_CREATED)
+def report_post(
+    post_id: str,
+    body: PostReportCreate,
+    current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    post = _load_post(db, post_id)
+    if post.author_user_id == current_user.user_id:
+        raise HTTPException(status_code=400, detail="내가 작성한 글은 신고할 수 없습니다.")
+    key = f"{post_id}:{current_user.user_id}"
+    if db.get(CommunityPostReportRecord, key) is not None:
+        raise HTTPException(status_code=409, detail="이미 신고한 게시물입니다.")
+    report = CommunityPostReportRecord(
+        report_key=key, post_id=post_id, reporter_user_id=current_user.user_id,
+        reason=body.reason, detail=body.detail.strip(),
+    )
+    db.add(report)
+    db.commit()
+    return PostReportResponse(post_id=post_id, reported=True, reason=body.reason)
+
+
+@community_router.post("/posts/{post_id}/hide", response_model=PostHideResponse, status_code=status.HTTP_201_CREATED)
+def hide_post(
+    post_id: str,
+    current_user: UserRecord = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _load_post(db, post_id)
+    key = f"{post_id}:{current_user.user_id}"
+    if db.get(CommunityPostHiddenRecord, key) is None:
+        db.add(CommunityPostHiddenRecord(hide_key=key, post_id=post_id, user_id=current_user.user_id))
+        db.commit()
+    return PostHideResponse(post_id=post_id, hidden=True)
 
 
 @community_router.post("/posts/{post_id}/recommend", response_model=RecommendationResponse)

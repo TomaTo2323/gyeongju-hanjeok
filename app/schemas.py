@@ -275,21 +275,38 @@ class HealthResponse(BaseModel):
     integrations: dict[str, str]
 
 
+class ChatTurn(BaseModel):
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(min_length=1, max_length=2000)
+
+
 class RagSearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=500)
     top_k: int = Field(default=5, ge=1, le=10)
+    # 직전 대화 맥락(최근 몇 턴). "그거 주차는 되나요?" 같은 후속 질문을 이해하는 데 쓴다.
+    # 프론트에서 안 보내면 매 질문이 독립적으로 처리된다.
+    history: list[ChatTurn] = Field(default_factory=list, max_length=8)
 
 
 class RagHit(BaseModel):
+    source_type: str = "place"  # "place" | "etiquette"
     place_id: str
     title: str
     category: str
     similarity: float
     overview: str | None = None
     address: str | None = None
+    operating_hours: str | None = None
+    rest_date: str | None = None
+    fee_text: str | None = None
+    parking: str | None = None
+    stroller_info: str | None = None
+    pet_info: str | None = None
+    homepage: str | None = None
 
 
 class RagSearchResponse(BaseModel):
     query: str
     answer: str
     hits: list[RagHit]
+    grounded: bool = True
