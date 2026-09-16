@@ -2927,7 +2927,6 @@ class OpenAIClient(BaseClient):
 
         body = {
             "model": self.settings.openai_model,
-            "max_output_tokens": 700,
             "input": [
                 {
                     "role": "system",
