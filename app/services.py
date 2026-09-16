@@ -7188,8 +7188,11 @@ class RagService:
         # 비슷해(예: 관광지별 접근성 안내) 임베딩 유사도만으로는 정확한 장소를 놓칠 수
         # 있어서, 개수가 많지 않은 지금은 순위 대신 전부 넘기고 LLM이 관련된 것만
         # 골라 쓰게 한다. 문서가 크게 늘어나면 다시 상위 N개로 제한하는 게 맞다.
+        
+        # 수정: 관광지는 기존 top_k를 유지하고,
+        # 지식 문서는 질문과 가장 유사한 상위 5개만 LLM에 전달한다.
         selected = sorted(
-            place_scored[:top_k] + doc_scored,
+            place_scored[:top_k] + doc_scored[:5],
             key=lambda item: item[0],
             reverse=True,
         )
