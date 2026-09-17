@@ -7705,6 +7705,9 @@ class RagService:
             r"(?:피장자|묘주|무덤(?:의)?\s*주인(?:공)?).{0,40}(?:미상|알\s*수\s*없|밝혀지지|확인되지|명확하지|전해지지|추정)",
             r"(?:미상|알\s*수\s*없|밝혀지지|확인되지|명확하지|전해지지).{0,40}(?:피장자|묘주|무덤(?:의)?\s*주인(?:공)?)",
             r"[가-힣]{2,12}(?:의\s*무덤|이\s*묻힌\s*무덤|을\s*묻은\s*무덤)",
+            # 국립박물관 전시 설명처럼 특정 인명을 제시하지 않고
+            # '왕(족)의 무덤'으로 분류하는 공식 문장도 직접근거로 인정합니다.
+            r"왕\s*\(?족\)?(?:의)?\s*무덤",
         )
 
         sentences: list[tuple[int, str]] = []
@@ -7737,6 +7740,8 @@ class RagService:
                     score += 45
                 if any(word in sentence for word in ("미상", "알 수 없", "밝혀지지", "확인되지", "명확하지")):
                     score += 35
+                if re.search(r"왕\s*\(?족\)?(?:의)?\s*무덤", sentence):
+                    score += 30
             elif intent == "builder":
                 if not any(word in sentence for word in ("세웠", "지었", "창건", "건립", "조성", "완공", "완성", "시공")):
                     continue
@@ -7808,7 +7813,18 @@ class RagService:
             best = [item[1] for item in candidates[:2]]
         else:
             best = [item[1] for item in candidates[:2] if item[0] >= candidates[0][0] - 12]
-        return " ".join(best)
+
+        answer = " ".join(best)
+        if intent == "tomb_owner":
+            unknown_markers = ("미상", "알 수 없", "밝혀지지", "확인되지", "명확하지", "전해지지")
+            if not any(marker in answer for marker in unknown_markers) and re.search(
+                r"왕\s*\(?족\)?(?:의)?\s*무덤", answer
+            ):
+                return (
+                    "공식 자료에서는 이 무덤을 왕(족)의 무덤으로 소개하고 있으며, "
+                    "확인한 자료에는 특정 피장자의 이름이 제시되어 있지 않습니다. " + answer
+                )
+        return answer
 
     @classmethod
     def _context_directly_answers_query(cls, query: str, context: dict) -> bool:
@@ -7929,13 +7945,18 @@ class RagService:
 
         if intent == "tomb_owner":
             add_query(f"{primary} 피장자 무덤 주인 미상 밝혀지지")
-            add_query(f"{primary} 누구 무덤 피장자")
+            add_query(f"{primary} 왕족 무덤 국립경주박물관")
+            add_query(f"{primary} 피장자 국립경주박물관")
+            add_query(f"{primary} 피장자 국립문화유산연구원")
+            add_query(f"{primary} 피장자 국가유산포털")
         elif intent == "builder":
             add_query(f"{primary} 누가 세웠 건립 장인 아비지 창건")
-            add_query(f"{primary} 건립 주체")
+            add_query(f"{primary} 건립 주체 경주문화관광")
+            add_query(f"{primary} 장인 국가유산포털")
         elif intent == "date":
             add_query(f"{primary} 언제 창건 건립 완공 연대")
-            add_query(f"{primary} 몇 년 완성")
+            add_query(f"{primary} 몇 년 완성 국가유산포털")
+            add_query(f"{primary} 창건 국립경주박물관")
         elif intent == "artifact":
             add_query(f"{primary} 출토 유물")
         add_query(query)
@@ -7963,19 +7984,28 @@ class RagService:
                 return []
 
         # WARNING level is intentional during contest validation: Railway commonly hides INFO logs.
+        trace_queries = search_queries[:10]
         logger.warning(
             "RAG-TRACE search start query=%r intent=%s subject=%r variants=%s daum_queries=%s",
-            query, intent, primary, variants[:3], search_queries[:7],
+            query, intent, primary, variants[:3], trace_queries,
+        )
+        print(
+            f"RAG-TRACE search start query={query!r} intent={intent} subject={primary!r} daum_queries={trace_queries!r}",
+            flush=True,
         )
         heritage_batches, daum_batches = await asyncio.gather(
             asyncio.gather(*(heritage_lookup(v) for v in variants[:3])),
-            asyncio.gather(*(daum_lookup(q) for q in search_queries[:7])),
+            asyncio.gather(*(daum_lookup(q) for q in trace_queries)),
         )
+        raw_heritage_counts = [len(batch) for batch in heritage_batches]
+        raw_daum_counts = [len(batch) for batch in daum_batches]
         logger.warning(
             "RAG-TRACE raw query=%r heritage=%s daum=%s",
-            query,
-            [len(batch) for batch in heritage_batches],
-            [len(batch) for batch in daum_batches],
+            query, raw_heritage_counts, raw_daum_counts,
+        )
+        print(
+            f"RAG-TRACE raw query={query!r} heritage={raw_heritage_counts!r} daum={raw_daum_counts!r}",
+            flush=True,
         )
 
         # Collect more candidates first.  Do NOT truncate KHS results before Daum evidence is compared.
@@ -8027,12 +8057,18 @@ class RagService:
                     "_evidence": snippet_evidence,
                     "_score": docs_score,
                 })
-        documents.sort(key=lambda d: int(d.get("_score") or -10_000), reverse=True)
+        # Fetch priority must preserve strong subject/authority matches even when the Daum
+        # snippet itself does not contain the answer. V10 sorted by _score and then immediately
+        # sorted again by _evidence, which could push the actual official answer page out of
+        # the very small fetch window. Use one combined ordering instead.
+        def fetch_priority(document: dict) -> tuple[int, int, int]:
+            evidence = int(document.get("_evidence") or -10_000)
+            score = int(document.get("_score") or -10_000)
+            has_direct_snippet = 1 if evidence > -10_000 else 0
+            return (has_direct_snippet, evidence, score)
 
-        # Fetch pages whose snippets are promising first, but also allow top subject matches in case the
-        # Daum snippet is too short to contain the answer sentence.
-        documents.sort(key=lambda d: int(d.get("_evidence") or -10_000), reverse=True)
-        fetch_candidates = documents[:5]
+        documents.sort(key=fetch_priority, reverse=True)
+        fetch_candidates = documents[:10]
 
         async def fetch_document(document: dict) -> dict | None:
             url = str(document.get("url") or "")
@@ -8084,10 +8120,14 @@ class RagService:
 
         ranked.sort(key=lambda item: item[0], reverse=True)
         contexts = [context for _, context in ranked[: self.RAG_EXTERNAL_MAX_CONTEXTS]]
+        ranked_preview = [(score, c.get("title")) for score, c in ranked[:5]]
         logger.warning(
             "RAG-TRACE ranked query=%r candidates=%d direct=%d top=%s",
-            query, len(candidates), len(contexts),
-            [(score, c.get("title")) for score, c in ranked[:5]],
+            query, len(candidates), len(contexts), ranked_preview,
+        )
+        print(
+            f"RAG-TRACE ranked query={query!r} candidates={len(candidates)} direct={len(contexts)} top={ranked_preview!r}",
+            flush=True,
         )
 
         if contexts:
