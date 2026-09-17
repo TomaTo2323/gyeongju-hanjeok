@@ -6929,12 +6929,21 @@ class SyncService:
         ] * len(places)
 
         if self.settings.openai_api_key:
+            # 장소 임베딩에는 소개/주소뿐 아니라 방문 전에 자주 묻는 정형 정보도
+            # 함께 넣습니다. 운영시간/휴무일/요금/주차 질문이 역사·예절 문서보다
+            # 해당 장소 레코드와 더 강하게 연결되도록 하기 위함입니다.
             texts = [
                 (
                     f"{place.title}\n"
                     f"{place.category}\n"
                     f"{place.overview or ''}\n"
-                    f"{place.address or ''}"
+                    f"주소 {place.address or ''}\n"
+                    f"운영시간 {place.operating_hours or ''}\n"
+                    f"휴무일 {place.rest_date or ''}\n"
+                    f"입장료·요금 {place.fee_text or ''}\n"
+                    f"주차 {place.parking or ''}\n"
+                    f"전화 {place.tel or ''}\n"
+                    f"홈페이지 {place.homepage or ''}"
                 )
                 for place in places
             ]
@@ -7124,6 +7133,59 @@ def _rule_based_command(
 
 
 class RagService:
+    # 운영시간·휴무일·요금처럼 DB에 구조화되어 있는 값은 의미검색 결과에만
+    # 의존하지 않습니다. 질문 속 장소를 먼저 찾고 해당 필드를 직접 읽습니다.
+    STRUCTURED_INTENTS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+        (
+            "operating_hours",
+            (
+                "몇시", "몇 시", "몇시부터", "몇 시부터", "몇시까지", "몇 시까지",
+                "언제부터", "언제까지", "운영시간", "운영 시간", "관람시간", "관람 시간",
+                "개장시간", "개장 시간", "개방시간", "개방 시간", "영업시간", "영업 시간",
+                "마감", "문 닫", "문닫", "언제 열", "언제 닫", "열려", "열어",
+                "오픈", "개방", "운영해", "관람 가능", "입장 가능",
+            ),
+            "운영시간",
+        ),
+        (
+            "rest_date",
+            (
+                "휴무", "휴관", "쉬는날", "쉬는 날", "정기휴일", "정기 휴일",
+                "안 쉬", "쉬어", "쉬나요", "쉬니",
+            ),
+            "휴무일",
+        ),
+        (
+            "fee_text",
+            (
+                "입장료", "관람료", "이용료", "요금", "가격", "비용", "무료", "유료", "얼마",
+            ),
+            "입장료·요금",
+        ),
+        (
+            "parking",
+            ("주차", "주차장", "차 세", "차를 세"),
+            "주차",
+        ),
+        (
+            "tel",
+            ("전화", "연락처", "전화번호", "문의번호", "문의 번호"),
+            "전화",
+        ),
+        (
+            "homepage",
+            ("홈페이지", "공식사이트", "공식 사이트", "웹사이트", "사이트 주소"),
+            "홈페이지",
+        ),
+        (
+            "address",
+            ("주소", "어디에 있어", "어디 있어", "위치 알려", "위치가 어디"),
+            "주소",
+        ),
+    )
+
+    _GENERIC_ALIASES = {"경주", "관광", "여행"}
+
     def __init__(
         self,
         settings: Settings,
@@ -7131,8 +7193,197 @@ class RagService:
     ):
         self.settings = settings
         self.db = db
-        self.openai = OpenAIClient(
-            settings
+        self.openai = OpenAIClient(settings)
+        self.tour = TourApiClient(settings)
+
+    @classmethod
+    def _place_aliases(cls, title: str) -> list[str]:
+        normalized = normalize_name(title)
+        aliases = [normalized] if normalized else []
+
+        gyeongju = normalize_name("경주")
+        if normalized.startswith(gyeongju) and len(normalized) >= len(gyeongju) + 2:
+            aliases.append(normalized[len(gyeongju):])
+
+        return list(
+            dict.fromkeys(
+                alias
+                for alias in aliases
+                if len(alias) >= 2 and alias not in cls._GENERIC_ALIASES
+            )
+        )
+
+    def _exact_place_record(
+        self,
+        text: str,
+        records: list[PlaceRecord],
+    ) -> PlaceRecord | None:
+        normalized_query = normalize_name(text)
+        matches: list[tuple[int, int, PlaceRecord]] = []
+
+        for record in records:
+            aliases = self._place_aliases(record.title)
+            matched_length = max(
+                (len(alias) for alias in aliases if alias in normalized_query),
+                default=0,
+            )
+            if matched_length:
+                matches.append(
+                    (matched_length, len(normalize_name(record.title)), record)
+                )
+
+        if not matches:
+            return None
+
+        # 여러 장소명이 겹치면 질문에 실제로 포함된 가장 구체적인(긴) 명칭을 우선합니다.
+        matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return matches[0][2]
+
+    def _resolve_exact_place(
+        self,
+        query: str,
+        history: list[ChatTurn],
+        records: list[PlaceRecord],
+    ) -> PlaceRecord | None:
+        # 현재 질문에 장소명이 있으면 그것을 최우선으로 사용합니다.
+        direct = self._exact_place_record(query, records)
+        if direct is not None:
+            return direct
+
+        # "거기 몇 시까지야?" 같은 후속 질문이면 가장 최근 사용자 발화부터 거슬러 올라가
+        # 장소명을 찾습니다. 오래된 대화의 장소가 현재 질문을 덮어쓰지 않도록 역순 탐색합니다.
+        for turn in reversed(history):
+            if turn.role != "user":
+                continue
+            match = self._exact_place_record(turn.content, records)
+            if match is not None:
+                return match
+
+        return None
+
+    def _structured_fields(self, query: str) -> list[tuple[str, str]]:
+        lowered = query.lower()
+        result: list[tuple[str, str]] = []
+
+        for field_name, tokens, label in self.STRUCTURED_INTENTS:
+            if any(token in lowered for token in tokens):
+                result.append((field_name, label))
+
+        return result
+
+    @staticmethod
+    def _clean_structured_value(value: object) -> str:
+        if value is None:
+            return ""
+        text = re.sub(r"\s+", " ", str(value)).strip()
+        return text.strip("- ")
+
+    async def _refresh_place_record(
+        self,
+        record: PlaceRecord,
+        fields: list[tuple[str, str]],
+    ) -> PlaceRecord:
+        data = record.data or {}
+        missing = [
+            field_name
+            for field_name, _ in fields
+            if not self._clean_structured_value(data.get(field_name))
+        ]
+
+        if not missing:
+            return record
+
+        # 저장된 동기화 자료에 값이 없을 때만 관광공사 상세 API를 한 번 재확인합니다.
+        # 외부 API가 실패하더라도 기존 DB 자료를 유지한 채 안전하게 응답합니다.
+        try:
+            place = Place.model_validate(data)
+        except Exception:
+            place = Place(
+                place_id=record.place_id,
+                content_type_id=data.get("content_type_id"),
+                title=record.title,
+                category=record.category,
+                latitude=record.latitude,
+                longitude=record.longitude,
+                address=data.get("address"),
+                tel=data.get("tel"),
+                homepage=data.get("homepage"),
+            )
+
+        try:
+            detailed = await asyncio.wait_for(self.tour.detail(place), timeout=4.0)
+        except (IntegrationError, asyncio.TimeoutError):
+            return record
+
+        refreshed = detailed.model_dump(mode="json")
+        record.title = detailed.title
+        record.category = detailed.category
+        record.latitude = detailed.latitude
+        record.longitude = detailed.longitude
+        record.data = refreshed
+        record.updated_at = datetime.now(timezone.utc)
+
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+
+        return record
+
+    @staticmethod
+    def _place_hit(record: PlaceRecord, similarity: float) -> RagHit:
+        data = record.data or {}
+        return RagHit(
+            source_type="place",
+            place_id=record.place_id,
+            title=record.title,
+            category=record.category,
+            similarity=round(similarity, 4),
+            overview=data.get("overview"),
+            address=data.get("address"),
+            operating_hours=data.get("operating_hours"),
+            rest_date=data.get("rest_date"),
+            fee_text=data.get("fee_text"),
+            parking=data.get("parking"),
+            stroller_info=data.get("stroller_info"),
+            pet_info=data.get("pet_info"),
+            homepage=data.get("homepage"),
+        )
+
+    def _structured_answer(
+        self,
+        record: PlaceRecord,
+        fields: list[tuple[str, str]],
+    ) -> tuple[str, bool]:
+        data = record.data or {}
+        values: list[tuple[str, str]] = []
+        missing_labels: list[str] = []
+
+        for field_name, label in fields:
+            value = self._clean_structured_value(data.get(field_name))
+            if value:
+                values.append((label, value))
+            else:
+                missing_labels.append(label)
+
+        if len(fields) == 1:
+            label = fields[0][1]
+            if values:
+                return (
+                    f"관광공사 등록 자료 기준, {record.title}의 {label}은 {values[0][1]}입니다.",
+                    True,
+                )
+            return (
+                f"현재 관광공사 등록 자료에서는 {record.title}의 {label} 정보를 확인할 수 없습니다. "
+                "최신 정보는 해당 장소의 공식 안내를 확인해 주세요.",
+                False,
+            )
+
+        chunks = [f"{label}: {value}" for label, value in values]
+        chunks.extend(f"{label}: 확인되지 않음" for label in missing_labels)
+        return (
+            f"관광공사 등록 자료 기준, {record.title} 방문 정보입니다. " + " / ".join(chunks),
+            bool(values),
         )
 
     async def search(
@@ -7143,56 +7394,83 @@ class RagService:
     ) -> RagSearchResponse:
         history = history or []
 
-        # "그거 주차는 되나요?" 같은 후속 질문은 현재 질문만 임베딩하면 어떤 장소를
-        # 말하는지 검색이 못 잡는다. 직전 사용자 발화를 붙여서 검색용 텍스트를
-        # 만들되, 화면/응답에 쓰는 query 자체는 원래 질문 그대로 둔다.
+        # 의미검색에는 직전 사용자 발화를 보강해 지시어("그거", "거기") 문맥을 살립니다.
         last_user_turn = next(
             (turn.content for turn in reversed(history) if turn.role == "user"),
             None,
         )
         search_text = f"{last_user_turn}\n{query}" if last_user_turn else query
 
-        vector = (
-            await self.openai.embeddings(
-                [search_text]
+        # 장소명 탐지는 embedding보다 먼저 수행합니다. embedding이 아직 없는 레코드도
+        # 운영시간/요금 같은 정형 질문에는 사용할 수 있습니다.
+        all_place_records = list(self.db.scalars(select(PlaceRecord)).all())
+        exact_place = self._resolve_exact_place(query, history, all_place_records)
+        structured_fields = self._structured_fields(query)
+
+        if exact_place is not None and structured_fields:
+            exact_place = await self._refresh_place_record(exact_place, structured_fields)
+            answer, grounded = self._structured_answer(exact_place, structured_fields)
+            return RagSearchResponse(
+                query=query,
+                answer=answer,
+                hits=[self._place_hit(exact_place, 1.0)],
+                grounded=grounded,
             )
-        )[0]
 
-        place_records = self.db.scalars(
-            select(PlaceRecord).where(PlaceRecord.embedding.is_not(None))
-        ).all()
-        doc_records = self.db.scalars(
-            select(KnowledgeDocument).where(KnowledgeDocument.embedding.is_not(None))
-        ).all()
+        vector = (await self.openai.embeddings([search_text]))[0]
 
-        if not place_records and not doc_records:
+        place_records = [record for record in all_place_records if record.embedding]
+        doc_records = list(
+            self.db.scalars(
+                select(KnowledgeDocument).where(KnowledgeDocument.embedding.is_not(None))
+            ).all()
+        )
+
+        if not place_records and not doc_records and exact_place is None:
             raise ValueError(
-                "RAG 인덱스가 없습니다. "
-                "먼저 POST /api/v1/admin/sync를 실행하세요."
+                "RAG 인덱스가 없습니다. 먼저 POST /api/v1/admin/sync를 실행하세요."
             )
+
+        exact_aliases = self._place_aliases(exact_place.title) if exact_place is not None else []
+
+        def place_score(record: PlaceRecord) -> float:
+            score = _cosine(vector, record.embedding or [])
+            if exact_place is not None and record.place_id == exact_place.place_id:
+                # 질문에 명시된 장소는 의미검색 오차로 밀리지 않도록 우선합니다.
+                score = max(score, 0.99)
+            return score
+
+        def doc_score(record: KnowledgeDocument) -> float:
+            score = _cosine(vector, record.embedding or [])
+            if exact_aliases:
+                searchable = normalize_name(f"{record.title} {record.text[:800]}")
+                if any(alias in searchable for alias in exact_aliases):
+                    score = max(score, 0.96)
+            return score
 
         place_scored = sorted(
-            ((_cosine(vector, record.embedding or []), "place", record) for record in place_records),
-            key=lambda item: item[0],
-            reverse=True,
-        )
-        doc_scored = sorted(
-            ((_cosine(vector, record.embedding or []), "etiquette", record) for record in doc_records),
+            ((place_score(record), "place", record) for record in place_records),
             key=lambda item: item[0],
             reverse=True,
         )
 
-        # 관광지(300여 건)와 지식 문서(에티켓/접근성, 10여 건)를 한 풀에서 top-k로
-        # 경쟁시키면 지식 문서가 항상 밀려나 답변에 반영되지 못한다. 그래서 관광지는
-        # top-k만 뽑되, 지식 문서는 개수가 적으니 전부 포함해 둔다. 문서 문구가 서로
-        # 비슷해(예: 관광지별 접근성 안내) 임베딩 유사도만으로는 정확한 장소를 놓칠 수
-        # 있어서, 개수가 많지 않은 지금은 순위 대신 전부 넘기고 LLM이 관련된 것만
-        # 골라 쓰게 한다. 문서가 크게 늘어나면 다시 상위 N개로 제한하는 게 맞다.
-        
-        # 수정: 관광지는 기존 top_k를 유지하고,
-        # 지식 문서는 질문과 가장 유사한 상위 5개만 LLM에 전달한다.
+        # exact 장소가 아직 embedding되지 않았더라도 일반 장소 질문에서는 컨텍스트에 포함합니다.
+        if exact_place is not None and all(
+            record.place_id != exact_place.place_id for _, _, record in place_scored
+        ):
+            place_scored.insert(0, (0.99, "place", exact_place))
+
+        doc_scored = sorted(
+            ((doc_score(record), "etiquette", record) for record in doc_records),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        # 지식문서 전체를 LLM에 넘기지 않습니다. 장소 top-k와 지식문서 상위 N개만 사용해
+        # 역사·접근성·예절 문서가 무관한 질문에 과도하게 섞이는 현상을 줄입니다.
+        knowledge_limit = max(3, min(6, top_k + 1))
         selected = sorted(
-            place_scored[:top_k] + doc_scored[:5],
+            place_scored[:top_k] + doc_scored[:knowledge_limit],
             key=lambda item: item[0],
             reverse=True,
         )
@@ -7200,45 +7478,34 @@ class RagService:
         if not selected or selected[0][0] < self.settings.rag_min_similarity:
             return RagSearchResponse(
                 query=query,
-                answer="질문과 관련해 확인할 수 있는 자료가 부족합니다. 관광지명을 함께 알려주시면 다시 찾아볼게요.",
+                answer=(
+                    "질문과 관련해 확인할 수 있는 자료가 부족합니다. "
+                    "관광지명을 함께 알려주시면 다시 찾아볼게요."
+                ),
                 hits=[],
                 grounded=False,
             )
 
-        # LLM에는 selected(관광지 top-k + 지식 문서 전체)를 다 보여줘 정확한 장소를
-        # 놓치지 않게 하되, 화면에는 실제로 유사도가 높은 상위 항목만 "참고한 자료"로
-        # 보여준다 — 매번 지식 문서 10여 개가 전부 칩으로 뜨면 오히려 혼란스럽다.
+        # 화면의 참고자료는 LLM에 넘긴 모든 문서가 아니라 실제 상위 자료만 보여줍니다.
         display_pool = selected[:top_k]
 
         contexts: list[dict] = []
-        for score, source_type, record in selected:
+        for _, source_type, record in selected:
             if source_type == "place":
                 contexts.append(record.data or {})
             else:
-                contexts.append({"title": record.title, "category": record.category, "overview": record.text})
+                contexts.append(
+                    {
+                        "title": record.title,
+                        "category": record.category,
+                        "overview": record.text,
+                    }
+                )
 
         hits: list[RagHit] = []
         for score, source_type, record in display_pool:
             if source_type == "place":
-                data = record.data or {}
-                hits.append(
-                    RagHit(
-                        source_type="place",
-                        place_id=record.place_id,
-                        title=record.title,
-                        category=record.category,
-                        similarity=round(score, 4),
-                        overview=data.get("overview"),
-                        address=data.get("address"),
-                        operating_hours=data.get("operating_hours"),
-                        rest_date=data.get("rest_date"),
-                        fee_text=data.get("fee_text"),
-                        parking=data.get("parking"),
-                        stroller_info=data.get("stroller_info"),
-                        pet_info=data.get("pet_info"),
-                        homepage=data.get("homepage"),
-                    )
-                )
+                hits.append(self._place_hit(record, score))
             else:
                 hits.append(
                     RagHit(
@@ -7251,18 +7518,13 @@ class RagService:
                     )
                 )
 
-        answer = await self.openai.answer_with_context(
-            query,
-            contexts,
-            history=history,
-        )
+        answer = await self.openai.answer_with_context(query, contexts, history=history)
 
         return RagSearchResponse(
             query=query,
             answer=answer,
             hits=hits,
         )
-
 
 def _cosine(
     a: list[float],
