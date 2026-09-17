@@ -7467,6 +7467,38 @@ class RagService:
         )
 
     @staticmethod
+    def _answer_is_grounded_unknown(answer: str) -> bool:
+        compact = re.sub(r"\s+", " ", answer or "").strip()
+        return any(
+            phrase in compact
+            for phrase in (
+                "알 수 없",
+                "미상",
+                "밝혀지지 않",
+                "확인되지 않",
+                "명시되어 있지 않",
+                "명시하지 않",
+                "확정되지 않",
+                "전해지지 않",
+            )
+        )
+
+    @classmethod
+    def _clean_external_answer(cls, answer: str) -> str:
+        cleaned = (answer or "").strip()
+        if cls._answer_is_grounded_unknown(cleaned):
+            cleaned = re.sub(
+                r"^\s*(?:확인할 수 있는 자료가 부족합니다|자료가 부족합니다)[.!]?\s*",
+                "",
+                cleaned,
+                count=1,
+            )
+        cleaned = re.sub(r"(?m)^\s*[-•]?\s*https?://\S+\s*$", "", cleaned)
+        cleaned = re.sub(r"https?://[^\s)\]]+", "", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned
+
+    @staticmethod
     def _external_hit(context: dict, index: int) -> RagHit:
         source_url = str(context.get("source_url") or context.get("homepage") or "")
         source_name = str(context.get("source_name") or "공식 자료")
@@ -7760,8 +7792,13 @@ class RagService:
         if not contexts:
             return None
 
+        # 화면과 모델에 너무 많은 출처를 넘기지 않습니다. 공식성/관련도 순으로 이미 정렬된
+        # 상위 3개만 사용하면 답변 집중도와 모바일 UI 가독성이 좋아집니다.
+        contexts = contexts[:3]
         answer = await self.openai.answer_with_context(query, contexts, history=history)
-        grounded = not self._answer_needs_external_fallback(answer)
+        answer = self._clean_external_answer(answer)
+        grounded_unknown = self._answer_is_grounded_unknown(answer)
+        grounded = grounded_unknown or not self._answer_needs_external_fallback(answer)
         return RagSearchResponse(
             query=query,
             answer=answer,

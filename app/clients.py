@@ -3649,7 +3649,6 @@ class OpenAIClient(BaseClient):
                         _line("유모차", c.get("stroller_info")),
                         _line("반려동물 동반", c.get("pet_info")),
                         _line("카드결제", c.get("credit_card_info")),
-                        _line("홈페이지", c.get("homepage")),
                     ],
                 )
             )
@@ -3672,10 +3671,12 @@ class OpenAIClient(BaseClient):
                     "content": (
                         "당신은 경주 관광 안내 챗봇입니다. 아래 [제목]이 붙은 자료만 근거로 한국어로 답하세요.\n"
                         "- 자료에 없는 사실은 절대로 지어내지 말고, 그 부분은 확인할 수 없다고 명시하세요.\n"
-                        "- 질문에 답할 만한 자료가 부족하면 억지로 답하지 말고 "
-                        "\"확인할 수 있는 자료가 부족합니다\"라고 답하세요. "
-                        "이때 자료에 홈페이지 주소가 있으면 거기서 확인해보라고 안내하세요.\n"
-                        "- 답변 근거로 사용한 자료는 대괄호 안 제목 그대로 표시하세요 (예: [경주 동궁과 월지]).\n"
+                        "- 질문에 답할 만한 자료가 정말 없을 때만 \"확인할 수 있는 자료가 부족합니다\"라고 답하세요.\n"
+                        "- 공식 자료가 피장자·연대·정설 등을 '미상', '알 수 없음', '밝혀지지 않음'처럼 명시하면, "
+                        "그 사실 자체가 근거 있는 답변입니다. 이 경우 '자료가 부족하다'고 표시하지 마세요.\n"
+                        "- URL은 답변 본문에 직접 쓰거나 나열하지 마세요. 출처 링크는 앱의 참고자료 UI가 별도로 보여줍니다.\n"
+                        "- 답변 근거로 실제 사용한 자료 제목만 대괄호로 표시하고, 최대 3개까지만 인용하세요.\n"
+                        "- 사용자가 바로 이해할 수 있도록 먼저 핵심 답을 1~3문장으로 말하고, 불필요한 원문 링크 목록이나 장황한 안내는 붙이지 마세요.\n"
                         "- 특정 국가·인종·종교 집단 전체를 일반화하는 발언은 하지 마세요. 역사적 국제교류는 "
                         "구체적인 유물·유적 사실로만 설명하고, 학계에서 이견이 있는 내용은 정설처럼 "
                         "단정하지 말고 자료에 적힌 대로 이견이 있다는 점을 함께 전하세요.\n"
@@ -3697,7 +3698,13 @@ class OpenAIClient(BaseClient):
             headers=self.headers,
             timeout_seconds=60.0,
 )
-        return _extract_openai_text(payload)
+        answer = _extract_openai_text(payload)
+        # 원문 URL은 참고자료 UI에서 처리하므로 답변 본문에서는 제거합니다.
+        answer = re.sub(r"(?m)^\s*[-•]?\s*https?://\S+\s*$", "", answer)
+        answer = re.sub(r"https?://[^\s)\]]+", "", answer)
+        answer = re.sub(r"[ \t]+\n", "\n", answer)
+        answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
+        return answer
 
     async def embeddings(self, texts: list[str]) -> list[list[float]]:
         if not texts:
