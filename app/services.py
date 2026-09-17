@@ -7651,76 +7651,168 @@ class RagService:
         )
         return any(token in compact for token in tokens)
 
-    @classmethod
-    def _extractive_context_answer(cls, query: str, contexts: list[dict]) -> str:
-        """LLM이 시간 예산을 넘긴 경우에도 질문 대상/의도와 맞는 공식문장만 반환합니다."""
-        variants = cls._external_subject_variants(query, query)
-        subject_keys = [normalize_name(v) for v in variants[:3] if len(normalize_name(v)) >= 2]
-        query_tokens = [
-            token.lower()
-            for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query or "")
-            if token not in {"알려줘", "알려", "누구", "누가", "언제", "어디", "뭐야", "무엇"}
-        ]
-        compact_query = re.sub(r"\s+", "", query or "")
-        wants_when = any(token in compact_query for token in ("언제", "몇년", "몇년도", "시대", "만들", "창건", "건립", "완성", "조성"))
-        wants_tomb_owner = any(token in compact_query for token in ("피장자", "무덤주인", "누구무덤", "누구의무덤")) or (
-            "무덤" in compact_query and any(token in compact_query for token in ("누구", "주인"))
+    @staticmethod
+    def _heritage_query_intent(query: str) -> str:
+        compact = re.sub(r"\s+", "", query or "")
+        if (
+            any(token in compact for token in ("피장자", "무덤주인", "누구무덤", "누구의무덤"))
+            or ("무덤" in compact and any(token in compact for token in ("누구", "주인")))
+        ):
+            return "tomb_owner"
+        if any(token in compact for token in ("누가세웠", "누가지었", "누가만들", "누가창건")):
+            return "builder"
+        if any(token in compact for token in ("언제", "몇년", "몇년도", "시대")) and any(
+            token in compact for token in ("만들", "세웠", "지었", "창건", "건립", "조성", "완성")
+        ):
+            return "date"
+        if any(token in compact for token in ("유물", "출토", "나왔", "발견")):
+            return "artifact"
+        if any(token in compact for token in ("왜", "이유", "목적")):
+            return "reason"
+        return "generic"
+
+    @staticmethod
+    def _heritage_artifact_title(title: str) -> bool:
+        compact = normalize_name(title or "")
+        artifact_tokens = (
+            "금관", "관모", "금제", "은제", "귀걸이", "목걸이", "허리띠", "장신구",
+            "마구", "토기", "도기", "철기", "유물", "출토품", "관식", "천마도",
         )
-        wants_builder = any(token in compact_query for token in ("누가", "누구")) and any(
-            token in compact_query for token in ("세웠", "지었", "만들", "창건", "건립", "조성", "완성")
+        return any(token in compact for token in artifact_tokens)
+
+    @classmethod
+    def _direct_evidence_sentences(cls, query: str, context: dict) -> list[tuple[int, str]]:
+        """Return only sentences that actually answer the user's predicate.
+
+        A page merely mentioning the same heritage name is not evidence.  In
+        particular, artifact pages such as ``천마총 금관`` must never answer a
+        question about the tomb occupant unless the text explicitly discusses
+        the occupant/owner.
+        """
+        variants = cls._external_subject_variants(query, query)
+        subject_keys = [normalize_name(v) for v in variants[:4] if len(normalize_name(v)) >= 2]
+        intent = cls._heritage_query_intent(query)
+        title = str(context.get("title") or "")
+        title_key = normalize_name(title)
+        title_subject = any(key in title_key for key in subject_keys) if subject_keys else False
+        raw = str(context.get("overview") or "")
+        if not raw.strip():
+            return []
+
+        # Tomb-owner questions are especially vulnerable to artifact false positives.
+        artifact_title = cls._heritage_artifact_title(title)
+        strong_owner_patterns = (
+            r"(?:피장자|묘주|무덤(?:의)?\s*주인(?:공)?).{0,40}(?:미상|알\s*수\s*없|밝혀지지|확인되지|명확하지|전해지지|추정)",
+            r"(?:미상|알\s*수\s*없|밝혀지지|확인되지|명확하지|전해지지).{0,40}(?:피장자|묘주|무덤(?:의)?\s*주인(?:공)?)",
+            r"[가-힣]{2,12}(?:의\s*무덤|이\s*묻힌\s*무덤|을\s*묻은\s*무덤)",
         )
 
-        candidates: list[tuple[int, int, str]] = []
+        sentences: list[tuple[int, str]] = []
         seen: set[str] = set()
-        for context in contexts[:3]:
-            context_title = normalize_name(str(context.get("title") or ""))
-            title_matches = any(key in context_title for key in subject_keys) if subject_keys else False
-            raw = str(context.get("overview") or "")
-            for sentence in re.split(r"[.!?。]\s+|다\.\s+|[\n\r]+", raw):
-                sentence = re.sub(r"\s+", " ", sentence).strip(" -·")
-                if len(sentence) < 15 or len(sentence) > 380 or sentence in seen:
+        # Split conservatively; Korean official pages often use line breaks rather than perfect punctuation.
+        for sentence in re.split(r"(?<=[.!?。])\s+|[\n\r]+", raw):
+            sentence = re.sub(r"\s+", " ", sentence).strip(" -·")
+            if len(sentence) < 12 or len(sentence) > 520 or sentence in seen:
+                continue
+            seen.add(sentence)
+            sentence_key = normalize_name(sentence)
+            subject_match = any(key in sentence_key for key in subject_keys) if subject_keys else False
+            if not (subject_match or title_subject):
+                continue
+
+            score = 0
+            if subject_match:
+                score += 30
+            elif title_subject:
+                score += 12
+
+            if intent == "tomb_owner":
+                strong = any(re.search(pattern, sentence) for pattern in strong_owner_patterns)
+                if not strong:
                     continue
-                sentence_key = normalize_name(sentence)
-                subject_match = any(key in sentence_key for key in subject_keys) if subject_keys else False
-                if not (title_matches or subject_match):
+                # Artifact pages can be used only when they contain explicit owner evidence.
+                if artifact_title:
+                    score -= 20
+                if any(word in sentence for word in ("피장자", "묘주", "무덤 주인", "무덤의 주인", "주인공")):
+                    score += 45
+                if any(word in sentence for word in ("미상", "알 수 없", "밝혀지지", "확인되지", "명확하지")):
+                    score += 35
+            elif intent == "builder":
+                if not any(word in sentence for word in ("세웠", "지었", "창건", "건립", "조성", "완공", "완성", "시공")):
                     continue
-                if wants_when and not (
-                    re.search(r"(?:\d{3,4}년|\d{1,2}세기)", sentence)
-                    or any(word in sentence for word in ("창건", "건립", "완성", "조성", "시대", "경덕왕", "혜공왕"))
-                ):
+                if not any(word in sentence for word in ("의해", "장인", "명하여", "명령", "건의", "김대성", "자장", "아비지", "선덕여왕")):
                     continue
-                if wants_tomb_owner and not any(
-                    word in sentence
-                    for word in (
-                        "피장자", "무덤 주인", "무덤의 주인", "주인공", "누구의 무덤",
-                        "왕릉", "왕족", "묻힌", "매장", "미상", "알 수 없", "밝혀지지",
-                    )
-                ):
+                score += 55
+                if re.search(r"[가-힣]{2,8}(?:가|이|은|는|에게|에 의해)", sentence):
+                    score += 10
+            elif intent == "date":
+                if not re.search(r"(?:\d{3,4}년|\d{1,2}세기|신라\s*[가-힣]{2,8}\s*\d{1,2}년)", sentence):
                     continue
-                if wants_builder and not any(
-                    word in sentence
-                    for word in (
-                        "세웠", "지었", "창건", "건립", "조성", "완공", "완성",
-                        "장인", "의해", "김대성", "자장", "아비지",
-                    )
-                ):
+                if not any(word in sentence for word in ("시작", "창건", "건립", "조성", "완공", "완성", "만들", "세웠", "지었")):
+                    continue
+                score += 55
+            elif intent == "artifact":
+                if not any(word in sentence for word in ("출토", "발견", "유물", "금관", "천마도", "토기")):
+                    continue
+                score += 45
+            elif intent == "reason":
+                if not any(word in sentence for word in ("위해", "목적", "때문", "기원", "건의", "의미")):
+                    continue
+                score += 35
+            else:
+                score += 10
+
+            # Reward question vocabulary, but never let it replace the predicate gate above.
+            for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query or ""):
+                if token in {"알려줘", "알려", "누구", "누가", "언제", "어디", "뭐야", "무엇"}:
+                    continue
+                if normalize_name(token) in sentence_key:
+                    score += 4
+            sentences.append((score, sentence))
+
+        return sorted(sentences, key=lambda item: (item[0], -len(item[1])), reverse=True)
+
+    @classmethod
+    def _context_evidence_score(cls, query: str, context: dict) -> int:
+        evidence = cls._direct_evidence_sentences(query, context)
+        if not evidence:
+            return -10_000
+        source_name = str(context.get("source_name") or "")
+        authority = {
+            "국립경주박물관": 45,
+            "국가유산청": 42,
+            "국가유산포털": 40,
+            "국립문화유산연구원": 38,
+            "국립중앙박물관": 36,
+            "경주시": 30,
+            "대한민국 구석구석": 20,
+        }.get(source_name, 0)
+        return evidence[0][0] + authority
+
+    @classmethod
+    def _extractive_context_answer(cls, query: str, contexts: list[dict]) -> str:
+        candidates: list[tuple[int, str]] = []
+        seen: set[str] = set()
+        for context in contexts:
+            for score, sentence in cls._direct_evidence_sentences(query, context):
+                if sentence in seen:
                     continue
                 seen.add(sentence)
-                lowered = sentence.lower()
-                score = (10 if subject_match else 5) + sum(5 for token in query_tokens if token in lowered)
-                if re.search(r"(?:\d{3,4}년|\d{1,2}세기)", sentence):
-                    score += 5
-                if any(word in sentence for word in ("창건", "건립", "완성", "조성", "피장자", "출토", "무덤")):
-                    score += 3
-                candidates.append((score, -len(sentence), sentence))
+                candidates.append((score, sentence))
         if not candidates:
             return "공식 자료를 찾았지만 질문에 직접 답하는 근거를 확인하지 못했습니다."
-        return " ".join(item[2] for item in sorted(candidates, reverse=True)[:2])
+        candidates.sort(key=lambda item: (item[0], -len(item[1])), reverse=True)
+        intent = cls._heritage_query_intent(query)
+        if intent == "date":
+            # Construction-date questions often need both start and completion years.
+            best = [item[1] for item in candidates[:2]]
+        else:
+            best = [item[1] for item in candidates[:2] if item[0] >= candidates[0][0] - 12]
+        return " ".join(best)
 
     @classmethod
     def _context_directly_answers_query(cls, query: str, context: dict) -> bool:
-        answer = cls._extractive_context_answer(query, [context])
-        return "질문에 직접 답하는 근거를 확인하지 못했습니다" not in answer
+        return cls._context_evidence_score(query, context) > -10_000
 
     def _local_heritage_contexts(
         self,
@@ -7815,190 +7907,189 @@ class RagService:
         query: str,
         exact_place: PlaceRecord | None,
     ) -> list[dict]:
-        """국가유산청 + Daum + 신뢰 원문을 병렬화해 약 5초 이내에 수집합니다."""
+        """Search KHS + Daum concurrently, then rank by *answer evidence*, not name similarity."""
         subject = exact_place.title if exact_place is not None else query
         variants = self._external_subject_variants(subject, query)
         if not variants:
             return []
 
-        cache_key = normalize_name(f"{variants[0]}|{query}")
+        cache_key = normalize_name(f"v10|{variants[0]}|{query}")
         cached = self._external_context_cache.get(cache_key)
         if cached and time.monotonic() - cached[0] <= self.RAG_EXTERNAL_CACHE_TTL_SECONDS:
             return [dict(item) for item in cached[1]]
 
-        contexts: list[dict] = []
-        seen_urls: set[str] = set()
         primary = variants[0]
-
-        async def heritage_lookup(variant: str) -> list[dict]:
-            try:
-                return await asyncio.wait_for(
-                    self.heritage.contexts(variant, limit=2),
-                    timeout=self.RAG_HERITAGE_LOOKUP_TIMEOUT_SECONDS,
-                )
-            except (IntegrationError, asyncio.TimeoutError, ValueError):
-                return []
-
+        intent = self._heritage_query_intent(query)
         search_queries: list[str] = []
+
         def add_query(value: str) -> None:
             value = re.sub(r"\s+", " ", value).strip()
             if value and value not in search_queries:
                 search_queries.append(value)
 
-        compact_query = re.sub(r"\s+", "", query or "")
-        # 질문 의도 확장 검색어를 먼저 만들고 사용자의 원문 질문도 함께 보냅니다.
-        # 실제 호출은 병렬이므로 검색어 수가 늘어도 지연이 직렬 누적되지 않습니다.
-        if "무덤" in compact_query and any(token in compact_query for token in ("누구", "주인", "피장자")):
-            add_query(f"{primary} 피장자 무덤 주인 밝혀지지 미상")
-        elif any(token in compact_query for token in ("누가세웠", "누가지었", "누가만들", "누가창건")):
-            add_query(f"{primary} 건립 주체 장인 시공 창건")
-        elif any(token in compact_query for token in ("언제", "몇년", "몇년도", "시대", "창건", "건립", "조성", "완성")):
-            add_query(f"{primary} 창건 건립 완공 연대")
+        if intent == "tomb_owner":
+            add_query(f"{primary} 피장자 무덤 주인 미상 밝혀지지")
+            add_query(f"{primary} 누구 무덤 피장자")
+        elif intent == "builder":
+            add_query(f"{primary} 누가 세웠 건립 장인 아비지 창건")
+            add_query(f"{primary} 건립 주체")
+        elif intent == "date":
+            add_query(f"{primary} 언제 창건 건립 완공 연대")
+            add_query(f"{primary} 몇 년 완성")
+        elif intent == "artifact":
+            add_query(f"{primary} 출토 유물")
         add_query(query)
-        add_query(f"{primary} 경주문화관광")
-        add_query(f"{primary} 국가유산포털")
         add_query(f"{primary} 국립경주박물관")
+        add_query(f"{primary} 국가유산포털")
         add_query(f"{primary} 국가유산청")
+        add_query(f"{primary} 국립문화유산연구원")
+
+        async def heritage_lookup(variant: str) -> list[dict]:
+            try:
+                return await asyncio.wait_for(
+                    self.heritage.contexts(variant, limit=4),
+                    timeout=self.RAG_HERITAGE_LOOKUP_TIMEOUT_SECONDS,
+                )
+            except (IntegrationError, asyncio.TimeoutError, ValueError):
+                return []
 
         async def daum_lookup(search_query: str) -> list[dict]:
             try:
                 return await asyncio.wait_for(
-                    self.daum.web_documents(search_query, limit=12),
+                    self.daum.web_documents(search_query, limit=15),
                     timeout=self.RAG_DAUM_LOOKUP_TIMEOUT_SECONDS,
                 )
             except (IntegrationError, asyncio.TimeoutError, ValueError):
                 return []
 
-        # 국가유산청과 Daum을 반드시 병렬 호출합니다. Railway 로그에서 실제 호출 여부와
-        # 결과 개수를 확인할 수 있도록 진단 로그도 남깁니다.
-        logger.info(
-            "RAG external lookup start query=%r subject=%r variants=%s daum_queries=%s",
-            query, primary, variants[:3], search_queries[:6],
+        # WARNING level is intentional during contest validation: Railway commonly hides INFO logs.
+        logger.warning(
+            "RAG-TRACE search start query=%r intent=%s subject=%r variants=%s daum_queries=%s",
+            query, intent, primary, variants[:3], search_queries[:7],
         )
         heritage_batches, daum_batches = await asyncio.gather(
             asyncio.gather(*(heritage_lookup(v) for v in variants[:3])),
-            asyncio.gather(*(daum_lookup(q) for q in search_queries[:6])),
+            asyncio.gather(*(daum_lookup(q) for q in search_queries[:7])),
         )
-        logger.info(
-            "RAG external lookup raw results query=%r heritage=%s daum=%s",
+        logger.warning(
+            "RAG-TRACE raw query=%r heritage=%s daum=%s",
             query,
             [len(batch) for batch in heritage_batches],
             [len(batch) for batch in daum_batches],
         )
 
+        # Collect more candidates first.  Do NOT truncate KHS results before Daum evidence is compared.
+        candidates: list[dict] = []
+        seen_urls: set[str] = set()
         for batch in heritage_batches:
             for context in batch:
-                url = str(context.get("source_url") or "")
+                url = str(context.get("source_url") or context.get("homepage") or "")
                 if url and url in seen_urls:
                     continue
                 if url:
                     seen_urls.add(url)
-                contexts.append(context)
-                if len(contexts) >= self.RAG_EXTERNAL_MAX_CONTEXTS:
-                    break
-            if len(contexts) >= self.RAG_EXTERNAL_MAX_CONTEXTS:
-                break
+                candidates.append(context)
 
         documents: list[dict] = []
-        seen_search_urls: set[str] = set()
+        seen_doc_urls: set[str] = set()
         subject_keys = [normalize_name(v) for v in variants if normalize_name(v)]
-        query_tokens = [
-            token for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query)
-            if token not in {"알려줘", "알려", "누구", "누가", "뭐야", "어디", "경주"}
-        ]
+        authority_scores = {
+            "국립경주박물관": 55,
+            "국가유산청": 50,
+            "국가유산포털": 48,
+            "국립문화유산연구원": 45,
+            "국립중앙박물관": 42,
+            "경주시": 30,
+            "대한민국 구석구석": 20,
+        }
         for batch in daum_batches:
             for document in batch:
                 url = str(document.get("url") or "").strip()
-                if not url or url in seen_search_urls:
+                if not url or url in seen_doc_urls:
                     continue
                 source_name = self.trusted_web.trusted_source_name(url)
                 if not source_name:
                     continue
-                seen_search_urls.add(url)
-                searchable = normalize_name(f"{document.get('title', '')} {document.get('contents', '')}")
-                score = 120 if any(key and key in searchable for key in subject_keys) else 0
-                score += sum(6 for token in query_tokens if normalize_name(token) in searchable)
-                score += {
-                    "국립경주박물관": 55, "국가유산청": 50, "국가유산포털": 48,
-                    "국립문화유산연구원": 45, "국립중앙박물관": 42,
-                    "경주시": 30, "대한민국 구석구석": 20,
-                }.get(source_name, 0)
-                documents.append({**document, "source_name": source_name, "_score": score})
-        documents.sort(key=lambda item: int(item.get("_score") or 0), reverse=True)
+                seen_doc_urls.add(url)
+                clean_title = self._clean_search_title(document.get("title"))
+                contents = re.sub(r"<[^>]+>", " ", str(document.get("contents") or ""))
+                contents = re.sub(r"\s+", " ", contents).strip()
+                searchable = normalize_name(f"{clean_title} {contents}")
+                subject_score = 100 if any(key in searchable for key in subject_keys) else 0
+                # Keep the result even when the snippet is too short; the official page fetch may contain the answer.
+                snippet = self._trusted_search_snippet_context(document, source_name)
+                snippet_evidence = self._context_evidence_score(query, snippet) if snippet else -10_000
+                docs_score = max(snippet_evidence, subject_score + authority_scores.get(source_name, 0))
+                documents.append({
+                    **document,
+                    "source_name": source_name,
+                    "_snippet": snippet,
+                    "_evidence": snippet_evidence,
+                    "_score": docs_score,
+                })
+        documents.sort(key=lambda d: int(d.get("_score") or -10_000), reverse=True)
 
-        need_web_detail = (
-            len(contexts) < 2
-            or any(token in query for token in ("누구", "누가", "왜", "무덤", "피장자", "주인"))
+        # Fetch pages whose snippets are promising first, but also allow top subject matches in case the
+        # Daum snippet is too short to contain the answer sentence.
+        documents.sort(key=lambda d: int(d.get("_evidence") or -10_000), reverse=True)
+        fetch_candidates = documents[:5]
+
+        async def fetch_document(document: dict) -> dict | None:
+            url = str(document.get("url") or "")
+            try:
+                result = await asyncio.wait_for(
+                    self.trusted_web.fetch_document(url, query=query, title=primary),
+                    timeout=self.RAG_TRUSTED_FETCH_TIMEOUT_SECONDS,
+                )
+            except (IntegrationError, asyncio.TimeoutError, ValueError):
+                result = None
+            if result:
+                page_title = self._clean_search_title(document.get("title"))
+                if page_title:
+                    result["title"] = f"{result.get('source_name', '공식 자료')} - {page_title}"
+                return result
+            return document.get("_snippet")
+
+        fetched = await asyncio.gather(
+            *(fetch_document(document) for document in fetch_candidates),
+            return_exceptions=False,
+        ) if fetch_candidates else []
+        for context in fetched:
+            if not context:
+                continue
+            url = str(context.get("source_url") or context.get("homepage") or "")
+            # A KHS URL may duplicate a fetched page; content can differ, so only suppress exact dict duplicates later.
+            candidates.append(context)
+
+        # Include high-quality trusted snippets that were not fetched, then rank *all* candidates by
+        # whether they answer the predicate (who/when/builder/etc.).
+        for document in documents[5:10]:
+            snippet = document.get("_snippet")
+            if snippet:
+                candidates.append(snippet)
+
+        ranked: list[tuple[int, dict]] = []
+        seen_fingerprint: set[str] = set()
+        for context in candidates:
+            if not self._context_matches_subject(query, exact_place, context):
+                continue
+            score = self._context_evidence_score(query, context)
+            if score <= -10_000:
+                continue
+            fp = normalize_name(f"{context.get('title','')}|{context.get('overview','')[:220]}")
+            if fp in seen_fingerprint:
+                continue
+            seen_fingerprint.add(fp)
+            ranked.append((score, context))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        contexts = [context for _, context in ranked[: self.RAG_EXTERNAL_MAX_CONTEXTS]]
+        logger.warning(
+            "RAG-TRACE ranked query=%r candidates=%d direct=%d top=%s",
+            query, len(candidates), len(contexts),
+            [(score, c.get("title")) for score, c in ranked[:5]],
         )
-        if need_web_detail:
-            fetch_candidates = [
-                doc for doc in documents if str(doc.get("url") or "") not in seen_urls
-            ][:3]
 
-            async def fetch_document(document: dict) -> dict | None:
-                url = str(document.get("url") or "")
-                try:
-                    result = await asyncio.wait_for(
-                        self.trusted_web.fetch_document(url, query=query, title=primary),
-                        timeout=self.RAG_TRUSTED_FETCH_TIMEOUT_SECONDS,
-                    )
-                except (IntegrationError, asyncio.TimeoutError, ValueError):
-                    result = None
-                if result:
-                    page_title = self._clean_search_title(document.get("title"))
-                    if page_title:
-                        result["title"] = f"{result.get('source_name', '공식 자료')} - {page_title}"
-                    return result
-                source_name = str(document.get("source_name") or "")
-                return self._trusted_search_snippet_context(document, source_name) if source_name else None
-
-            fetched = await asyncio.gather(
-                *(fetch_document(document) for document in fetch_candidates),
-                return_exceptions=False,
-            ) if fetch_candidates else []
-            for context in fetched:
-                if not context:
-                    continue
-                url = str(context.get("source_url") or "")
-                if url and url in seen_urls:
-                    continue
-                if url:
-                    seen_urls.add(url)
-                contexts.append(context)
-                if len(contexts) >= self.RAG_EXTERNAL_MAX_CONTEXTS:
-                    break
-
-        if len(contexts) < self.RAG_EXTERNAL_MAX_CONTEXTS:
-            for document in documents:
-                url = str(document.get("url") or "")
-                if not url or url in seen_urls:
-                    continue
-                source_name = str(document.get("source_name") or "")
-                context = self._trusted_search_snippet_context(document, source_name) if source_name else None
-                if not context:
-                    continue
-                searchable = normalize_name(f"{context.get('title', '')} {context.get('overview', '')}")
-                if subject_keys and not any(key in searchable for key in subject_keys):
-                    continue
-                seen_urls.add(url)
-                contexts.append(context)
-                if len(contexts) >= self.RAG_EXTERNAL_MAX_CONTEXTS:
-                    break
-
-        before_filter = len(contexts)
-        contexts = [
-            context
-            for context in contexts
-            if self._context_matches_subject(query, exact_place, context)
-            and self._context_directly_answers_query(query, context)
-        ]
-        contexts = self._compact_external_contexts(contexts)
-        logger.info(
-            "RAG external lookup filtered query=%r before=%d direct=%d titles=%s",
-            query, before_filter, len(contexts), [c.get("title") for c in contexts],
-        )
-        # 실패/빈 결과는 캐시하지 않습니다. 일시적인 국가유산청/Daum 지연이
-        # 30분 동안 고착되어 이후 정상 요청까지 막는 현상을 방지합니다.
         if contexts:
             self._external_context_cache[cache_key] = (
                 time.monotonic(),
