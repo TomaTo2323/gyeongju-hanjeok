@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
-from app.db import NotificationRecord
+from .db import NotificationRecord
 
 
 def create_notification(
@@ -21,11 +21,7 @@ def create_notification(
     shared_route_id: str | None = None,
     route_request_id: str | None = None,
 ) -> NotificationRecord | None:
-    """
-    자기 자신이 한 행동은 알림을 만들지 않는다.
-    호출한 endpoint의 transaction 안에서 db.add만 하고,
-    최종 commit은 원래 endpoint에서 한 번만 수행하는 것을 권장한다.
-    """
+    """Create a notification inside the caller's existing transaction."""
     if actor_user_id and actor_user_id == user_id:
         return None
 
