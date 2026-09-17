@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
 import asyncio
 import random
@@ -52,6 +52,18 @@ DEFAULT_LONGITUDE = GYEONGJU_CENTER_LONGITUDE
 
 PLACE_DETAIL_CACHE_TTL_SECONDS = 15 * 60
 
+# 홈/지도/검색의 장소카드 소개문은 TourAPI 공식 상세정보에서만
+# 가볍게 보완합니다. NAVER/공식 홈페이지 검색은 상세(stage=full)에서만
+# 수행해 목록 API가 외부 검색 호출로 무거워지지 않도록 유지합니다.
+PLACE_LIST_OVERVIEW_CACHE_TTL_SECONDS = 30 * 60
+PLACE_LIST_OVERVIEW_CONCURRENCY = 8
+PLACE_LIST_OVERVIEW_TOTAL_TIMEOUT_SECONDS = 4.0
+
+_PLACE_LIST_OVERVIEW_CACHE: dict[
+    str,
+    tuple[float, str],
+] = {}
+
 async def _nearest_tourist_pool(
     settings: Settings,
 ) -> list[Place]:
@@ -73,20 +85,6 @@ _PLACE_DETAIL_CORE_CACHE: dict[
 _PLACE_DETAIL_FULL_CACHE: dict[
     str,
     tuple[float, Place],
-] = {}
-
-# ---------------------------------------------------------------------------
-# 장소명 검색 캐시
-#
-# /places?query=... 검색은 사용자 위치를 받지 않습니다.
-# 검색어만으로 경주의 공개 관광지 데이터를 찾고, 성공한 결과를 잠시 보관해
-# 한국관광공사 API 호출 한도(429)에 덜 의존하도록 합니다.
-# ---------------------------------------------------------------------------
-PLACE_SEARCH_CACHE_TTL_SECONDS = 30 * 60
-
-_PLACE_SEARCH_CACHE: dict[
-    str,
-    tuple[float, list[Place]],
 ] = {}
 
 
@@ -215,9 +213,6 @@ class FrontRecommendRequest(BaseModel):
     def start_longitude(self) -> float:
         return DEFAULT_LONGITUDE
     transport_type: str = "car"
-    # 여행 날짜/시각은 행사 기간·운영시간 검증용이며 사용자 위치와 무관합니다.
-    travel_date: str = ""  # YYYY-MM-DD
-    start_time: str = ""   # HH:mm
     radius_km: float = Field(default=15, gt=0, le=30)
     preferred_categories: list[str] = Field(default_factory=list)
     avoid_paid: bool = False
@@ -596,45 +591,6 @@ async def _apply_gpt_route_request(
     return updated
 
 
-def _front_trip_start(
-    body: FrontRecommendRequest,
-) -> datetime:
-    kst = timezone(timedelta(hours=9))
-    now = datetime.now(kst)
-
-    try:
-        travel_day = datetime.strptime(
-            body.travel_date.strip(),
-            "%Y-%m-%d",
-        ).date()
-    except (ValueError, AttributeError):
-        travel_day = now.date()
-
-    try:
-        hour_text, minute_text = body.start_time.strip().split(
-            ":",
-            1,
-        )
-        hour = int(hour_text)
-        minute = int(minute_text)
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError
-    except (ValueError, AttributeError):
-        # 날짜만 지정되고 시각이 없으면 현재시각을 공식 정보처럼 만들지 않고
-        # 요청 시작시각으로만 사용합니다.
-        hour = now.hour
-        minute = now.minute
-
-    return datetime(
-        travel_day.year,
-        travel_day.month,
-        travel_day.day,
-        hour,
-        minute,
-        tzinfo=kst,
-    )
-
-
 def _to_backend_request(
     body: FrontRecommendRequest,
     *,
@@ -677,7 +633,6 @@ def _to_backend_request(
     )
 
     return RecommendRequest(
-        start_time=_front_trip_start(body),
         available_minutes=max(
             60,
             round(
@@ -747,9 +702,6 @@ def _front_place_category(
     title = (
         place.title or ""
     ).lower()
-
-    if str(place.content_type_id or "") == "15":
-        return "행사"
 
     if (
         service_kind == "cafe"
@@ -1575,6 +1527,196 @@ def _front_overview_text(place: Place) -> str:
     return ""
 
 
+
+def _place_list_overview_cache_key(
+    place: Place,
+) -> str:
+    return (
+        f"{place.place_id.strip()}::"
+        f"{str(place.content_type_id or '').strip()}"
+    )
+
+
+def _place_list_overview_cache_get(
+    place: Place,
+) -> str | None:
+    key = _place_list_overview_cache_key(
+        place
+    )
+    cached = _PLACE_LIST_OVERVIEW_CACHE.get(
+        key
+    )
+
+    if cached is None:
+        return None
+
+    cached_at, overview = cached
+
+    if (
+        time.monotonic()
+        - cached_at
+        > PLACE_LIST_OVERVIEW_CACHE_TTL_SECONDS
+    ):
+        _PLACE_LIST_OVERVIEW_CACHE.pop(
+            key,
+            None,
+        )
+        return None
+
+    return overview
+
+
+def _place_list_overview_cache_set(
+    place: Place,
+    overview: str,
+) -> None:
+    _PLACE_LIST_OVERVIEW_CACHE[
+        _place_list_overview_cache_key(
+            place
+        )
+    ] = (
+        time.monotonic(),
+        overview,
+    )
+
+
+async def _fill_list_overviews_from_tourapi(
+    places: list[Place],
+    settings: Settings,
+) -> list[Place]:
+    """
+    홈/지도/검색 장소카드의 소개문이 비어 있을 때만 TourAPI 공식 상세정보를
+    병렬 조회해 overview를 보완합니다.
+
+    - 기존 overview가 있으면 추가 호출하지 않음
+    - 맛집/카페는 기존 구조화 fallback을 그대로 사용
+    - NAVER/공식 홈페이지 검색은 호출하지 않음
+    - 동시에 최대 8건만 조회
+    - 목록 전체 소개 보완은 최대 4초까지만 기다림
+    - 실패한 장소는 기존 값 그대로 반환해 목록 API 자체는 실패시키지 않음
+    - 30분 메모리 캐시로 같은 장소의 반복 상세 호출을 줄임
+
+    장소 소개 외의 필드는 건드리지 않습니다.
+    """
+    if not places:
+        return places
+
+    tour = TourApiClient(
+        settings
+    )
+    semaphore = asyncio.Semaphore(
+        PLACE_LIST_OVERVIEW_CONCURRENCY
+    )
+
+    async def fill_one(
+        place: Place,
+    ) -> None:
+        # 이미 카드에 표시할 소개가 있으면 그대로 유지합니다.
+        if _front_overview_text(place):
+            return
+
+        # 맛집/카페는 _front_overview_text()의 기존 grounded fallback 사용.
+        if _front_place_category(place) in {
+            "맛집",
+            "카페",
+        }:
+            return
+
+        cached = _place_list_overview_cache_get(
+            place
+        )
+
+        if cached:
+            place.overview = cached
+            return
+
+        try:
+            async with semaphore:
+                detailed = await asyncio.wait_for(
+                    tour.detail(
+                        place.model_copy(
+                            deep=True
+                        )
+                    ),
+                    timeout=2.5,
+                )
+        except (
+            asyncio.TimeoutError,
+            IntegrationError,
+            Exception,
+        ):
+            return
+
+        overview = re.sub(
+            r"\s+",
+            " ",
+            (
+                detailed.overview
+                or ""
+            ),
+        ).strip()
+
+        if (
+            not overview
+            or _looks_like_location_description(
+                overview
+            )
+        ):
+            return
+
+        # 목록 카드에서 필요한 소개문만 합칩니다.
+        # 혼잡도/좌표/운영시간/카테고리 등 기존 목록 데이터는 유지합니다.
+        place.overview = overview
+        _place_list_overview_cache_set(
+            place,
+            overview,
+        )
+
+    tasks = [
+        asyncio.create_task(
+            fill_one(place)
+        )
+        for place in places
+    ]
+
+    if not tasks:
+        return places
+
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=PLACE_LIST_OVERVIEW_TOTAL_TIMEOUT_SECONDS,
+    )
+
+    for task in pending:
+        task.cancel()
+
+    if pending:
+        await asyncio.gather(
+            *pending,
+            return_exceptions=True,
+        )
+
+    filled_count = sum(
+        1
+        for place in places
+        if bool(
+            _front_overview_text(
+                place
+            ).strip()
+        )
+    )
+
+    print(
+        "[PLACE LIST OVERVIEW]",
+        f"total={len(places)}",
+        f"filled={filled_count}",
+        f"completed_tasks={len(done)}",
+        f"cancelled_tasks={len(pending)}",
+    )
+
+    return places
+
+
 def _operating_hours_card_label(value: str | None) -> str:
     """카드용 짧은 운영시간 라벨. 추천시간과 혼동되지 않게 운영정보만 사용."""
     text = re.sub(r"\s+", " ", value or "").strip()
@@ -1654,13 +1796,6 @@ def _place_to_front(place: Place) -> dict[str, Any]:
         "rest_date": place.rest_date,
         "fee_text": place.fee_text,
         "parking": place.parking,
-        "event_start_date": place.event_start_date,
-        "event_end_date": place.event_end_date,
-        "event_start_time": place.event_start_time,
-        "event_end_time": place.event_end_time,
-        "event_place": place.event_place,
-        "event_time_type": place.event_time_type or "unknown",
-        "source": place.source,
         "phone": place.tel or "",
         "tel": place.tel or "",
         "homepage": place.homepage or "",
@@ -2018,427 +2153,6 @@ def _matches_home_category(
     return normalized.lower() in blob
 
 
-
-def _place_search_cache_get(
-    query: str,
-) -> list[Place] | None:
-    key = normalize_name(query)
-
-    if not key:
-        return None
-
-    cached = _PLACE_SEARCH_CACHE.get(key)
-
-    if cached is None:
-        return None
-
-    cached_at, places = cached
-
-    if (
-        time.monotonic()
-        - cached_at
-        > PLACE_SEARCH_CACHE_TTL_SECONDS
-    ):
-        _PLACE_SEARCH_CACHE.pop(key, None)
-        return None
-
-    return [
-        place.model_copy(deep=True)
-        for place in places
-    ]
-
-
-def _place_search_cache_set(
-    query: str,
-    places: list[Place],
-) -> None:
-    key = normalize_name(query)
-
-    if not key or not places:
-        return
-
-    _PLACE_SEARCH_CACHE[key] = (
-        time.monotonic(),
-        [
-            place.model_copy(deep=True)
-            for place in places
-        ],
-    )
-
-
-def _search_rank_key(
-    place: Place,
-    query: str,
-) -> tuple[int, int]:
-    normalized_query = normalize_name(query)
-    normalized_title = normalize_name(place.title)
-
-    if normalized_title == normalized_query:
-        match_rank = 0
-    elif (
-        normalized_query
-        and normalized_query in normalized_title
-    ):
-        match_rank = 1
-    elif (
-        normalized_title
-        and normalized_title in normalized_query
-    ):
-        match_rank = 2
-    else:
-        match_rank = 3
-
-    return (
-        match_rank,
-        abs(
-            len(normalized_title)
-            - len(normalized_query)
-        ),
-    )
-
-
-def _filter_gyeongju_places(
-    places: list[Place],
-) -> list[Place]:
-    filtered: list[Place] = []
-
-    for place in places:
-        address = (
-            place.address
-            or ""
-        ).strip()
-
-        if "경주" in address:
-            filtered.append(place)
-            continue
-
-        try:
-            distance = haversine_km(
-                DEFAULT_LATITUDE,
-                DEFAULT_LONGITUDE,
-                place.latitude,
-                place.longitude,
-            )
-        except Exception:
-            continue
-
-        if distance <= 50.0:
-            filtered.append(place)
-
-    return filtered
-
-
-async def _search_from_shared_gyeongju_pool(
-    search_query: str,
-    limit: int,
-    settings: Settings,
-) -> list[Place]:
-    """
-    코스 추천과 공유하는 경주시 관광지 풀을 먼저 검색합니다.
-
-    이 풀은 서버 프로세스 안에서 30분 캐시되므로 이미 한 번 채워진 경우
-    추가 TourAPI 키워드 호출 없이 장소카드를 찾을 수 있습니다.
-    """
-    try:
-        pool = await _nearest_tourist_pool(
-            settings
-        )
-    except Exception as exc:
-        print(
-            "[PLACE SEARCH POOL FALLBACK]"
-            f" query={search_query!r}"
-            f" error={type(exc).__name__}: {exc}"
-        )
-        return []
-
-    normalized_query = normalize_name(
-        search_query
-    )
-
-    matches = [
-        place.model_copy(deep=True)
-        for place in pool
-        if (
-            normalized_query
-            and (
-                normalized_query
-                in normalize_name(place.title)
-                or normalize_name(place.title)
-                in normalized_query
-            )
-        )
-    ]
-
-    matches.sort(
-        key=lambda place: _search_rank_key(
-            place,
-            search_query,
-        )
-    )
-
-    return matches[:limit]
-
-
-async def _search_from_tour_api(
-    search_query: str,
-    limit: int,
-    settings: Settings,
-) -> list[Place]:
-    """
-    서버 캐시/공유 풀에서 못 찾았을 때만 한국관광공사 API를 사용합니다.
-
-    일일 호출 한도 초과(HTTP 429) 등 IntegrationError가 발생해도
-    여기서 앱 검색 전체를 실패시키지 않고 빈 목록으로 반환합니다.
-    """
-    client = TourApiClient(settings)
-    places: list[Place] = []
-
-    try:
-        places = await client.keyword_search(
-            search_query,
-            limit=max(limit, 30),
-        )
-    except IntegrationError as exc:
-        print(
-            "[PLACE SEARCH TOURAPI FALLBACK]"
-            f" stage=regional"
-            f" query={search_query!r}"
-            f" status={exc.status_code}"
-            f" error={exc}"
-        )
-
-    if not places:
-        try:
-            places = _filter_gyeongju_places(
-                await client.keyword_search_global(
-                    search_query,
-                    limit=max(limit, 50),
-                )
-            )
-        except IntegrationError as exc:
-            print(
-                "[PLACE SEARCH TOURAPI FALLBACK]"
-                f" stage=global"
-                f" query={search_query!r}"
-                f" status={exc.status_code}"
-                f" error={exc}"
-            )
-            places = []
-
-    if (
-        not places
-        and not search_query.startswith("경주")
-    ):
-        try:
-            places = _filter_gyeongju_places(
-                await client.keyword_search_global(
-                    f"경주 {search_query}",
-                    limit=max(limit, 50),
-                )
-            )
-        except IntegrationError as exc:
-            print(
-                "[PLACE SEARCH TOURAPI FALLBACK]"
-                f" stage=global_prefixed"
-                f" query={search_query!r}"
-                f" status={exc.status_code}"
-                f" error={exc}"
-            )
-            places = []
-
-    places.sort(
-        key=lambda place: _search_rank_key(
-            place,
-            search_query,
-        )
-    )
-
-    return places[:limit]
-
-
-async def _search_from_kakao_public_places(
-    search_query: str,
-    limit: int,
-    settings: Settings,
-) -> list[Place]:
-    """
-    TourAPI가 429 등으로 막힌 경우의 최종 검색 fallback.
-
-    사용자 GPS는 사용하지 않습니다.
-    경주 고정 기준점과 공개 장소 검색 결과만 사용합니다.
-    """
-    try:
-        rows = await KakaoLocalClient(
-            settings
-        ).keyword_search(
-            f"경주 {search_query}",
-            latitude=DEFAULT_LATITUDE,
-            longitude=DEFAULT_LONGITUDE,
-            limit=min(max(limit, 10), 15),
-        )
-    except IntegrationError as exc:
-        print(
-            "[PLACE SEARCH KAKAO FALLBACK]"
-            f" query={search_query!r}"
-            f" status={exc.status_code}"
-            f" error={exc}"
-        )
-        return []
-
-    places: list[Place] = []
-
-    for row in rows:
-        title = str(
-            row.get("title")
-            or ""
-        ).strip()
-
-        if not title:
-            continue
-
-        address = str(
-            row.get("road_address")
-            or row.get("address")
-            or ""
-        ).strip()
-
-        if address and "경주" not in address:
-            continue
-
-        try:
-            latitude = float(
-                row.get("latitude")
-            )
-            longitude = float(
-                row.get("longitude")
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            continue
-
-        kakao_id = str(
-            row.get("id")
-            or ""
-        ).strip()
-
-        if not kakao_id:
-            safe_title = re.sub(
-                r"[^0-9A-Za-z가-힣]+",
-                "_",
-                title,
-            ).strip("_")
-            kakao_id = (
-                f"{safe_title}_"
-                f"{round(latitude, 6)}_"
-                f"{round(longitude, 6)}"
-            )
-
-        places.append(
-            Place(
-                place_id=f"kakao_{kakao_id}",
-                content_type_id="12",
-                title=title,
-                address=address or None,
-                latitude=latitude,
-                longitude=longitude,
-                category="관광지",
-                kakao_place_url=(
-                    str(
-                        row.get("place_url")
-                        or ""
-                    ).strip()
-                    or None
-                ),
-                raw={
-                    "source": "kakao_local_fallback",
-                    "kakao_local": row,
-                },
-            )
-        )
-
-    places = _filter_gyeongju_places(
-        places
-    )
-
-    places.sort(
-        key=lambda place: _search_rank_key(
-            place,
-            search_query,
-        )
-    )
-
-    return places[:limit]
-
-
-async def _search_places_without_user_location(
-    search_query: str,
-    limit: int,
-    settings: Settings,
-) -> list[Place]:
-    """
-    장소명 검색 전용 흐름.
-
-    1. 이 프로세스의 성공 검색 캐시
-    2. 코스 추천과 공유하는 경주시 관광지 풀
-    3. 한국관광공사 키워드 검색
-    4. TourAPI 장애/429 시 Kakao 공개 장소 검색
-
-    어떤 단계에서도 사용자의 latitude/longitude를 받거나 전송하지 않습니다.
-    """
-    cached = _place_search_cache_get(
-        search_query
-    )
-
-    if cached:
-        return cached[:limit]
-
-    places = await _search_from_shared_gyeongju_pool(
-        search_query,
-        max(limit, 30),
-        settings,
-    )
-
-    if not places:
-        places = await _search_from_tour_api(
-            search_query,
-            max(limit, 30),
-            settings,
-        )
-
-    if not places:
-        places = await _search_from_kakao_public_places(
-            search_query,
-            max(limit, 20),
-            settings,
-        )
-
-    places = [
-        place
-        for place in places
-        if is_user_facing_travel_place(
-            place
-        )
-    ]
-
-    places.sort(
-        key=lambda place: _search_rank_key(
-            place,
-            search_query,
-        )
-    )
-
-    places = places[:limit]
-
-    _place_search_cache_set(
-        search_query,
-        places,
-    )
-
-    return places
-
-
 async def _list_places(
     *,
     latitude: float,
@@ -2455,14 +2169,89 @@ async def _list_places(
         if query.strip():
             search_query = query.strip()
 
-            # 사용자 위치는 받지 않고 장소명만으로 검색합니다.
-            # 서버 캐시/공유 장소 풀을 먼저 사용하고, TourAPI는 fallback,
-            # TourAPI 429 시에는 Kakao 공개 장소 검색으로 최종 보완합니다.
-            places = await _search_places_without_user_location(
+            # 1) 우선 기존 경주 지역필터 검색
+            places = await client.keyword_search(
                 search_query,
-                limit,
-                settings,
+                limit=max(limit, 30),
             )
+
+            # 2) KorService2 지역필터 검색에서 유명 관광지가 누락되는 경우가 있어
+            #    결과가 없으면 전국 키워드 검색 후 경주 지역 결과만 남깁니다.
+            if not places:
+                global_places = await client.keyword_search_global(
+                    search_query,
+                    limit=max(limit, 50),
+                )
+
+                gyeongju_places: list[Place] = []
+
+                for place in global_places:
+                    address = (place.address or "").strip()
+
+                    # 주소에 경주가 명시되어 있으면 가장 확실하게 허용
+                    if "경주" in address:
+                        gyeongju_places.append(place)
+                        continue
+
+                    # 주소 정보가 약한 데이터는 경주 중심 반경 50km 이내인지 확인
+                    try:
+                        distance_from_gyeongju = haversine_km(
+                            DEFAULT_LATITUDE,
+                            DEFAULT_LONGITUDE,
+                            place.latitude,
+                            place.longitude,
+                        )
+                    except Exception:
+                        continue
+
+                    if distance_from_gyeongju <= 50.0:
+                        gyeongju_places.append(place)
+
+                places = gyeongju_places
+
+            # 3) 그래도 없으면 "경주 + 검색어" 형태도 한 번 시도합니다.
+            if not places and not search_query.startswith("경주"):
+                places = await client.keyword_search_global(
+                    f"경주 {search_query}",
+                    limit=max(limit, 50),
+                )
+
+                places = [
+                    place
+                    for place in places
+                    if (
+                        "경주" in (place.address or "")
+                        or haversine_km(
+                            DEFAULT_LATITUDE,
+                            DEFAULT_LONGITUDE,
+                            place.latitude,
+                            place.longitude,
+                        ) <= 50.0
+                    )
+                ]
+
+            # 4) 검색 결과는 정확한 장소명에 가까운 순서로 우선 정렬
+            normalized_query = normalize_name(search_query)
+
+            def search_rank(place: Place) -> tuple[int, int]:
+                normalized_title = normalize_name(place.title)
+
+                if normalized_title == normalized_query:
+                    match_rank = 0
+                elif normalized_query in normalized_title:
+                    match_rank = 1
+                elif normalized_title in normalized_query:
+                    match_rank = 2
+                else:
+                    match_rank = 3
+
+                return (
+                    match_rank,
+                    abs(len(normalized_title) - len(normalized_query)),
+                )
+
+            places.sort(key=search_rank)
+            places = places[:limit]
         else:
             # 홈 카테고리 필터는 조회 후 세부 분류를 판별하므로
             # 최초 후보를 충분히 가져와야 특정 카테고리가 0건으로
@@ -2519,6 +2308,14 @@ async def _list_places(
 
         # 사용자 화면에는 요청한 limit까지만 반환합니다.
         places = places[:limit]
+
+    # 장소카드 소개가 비어 있는 관광지만 TourAPI 공식 상세정보의 overview로
+    # 가볍게 보완합니다. 기능 로직/혼잡도 계산/정렬은 기존 그대로 유지합니다.
+    places = await _fill_list_overviews_from_tourapi(
+        places,
+        settings,
+    )
+
     places = await _enrich_congestion(
         places,
         settings,
