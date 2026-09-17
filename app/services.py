@@ -7204,6 +7204,16 @@ class RagService:
         self.daum = DaumSearchClient(settings)
         self.trusted_web = TrustedWebSourceClient(settings)
 
+    @staticmethod
+    def _timing_log(stage: str, **values: object) -> None:
+        parts = [f"RAG-TIMING stage={stage}"]
+        for key, value in values.items():
+            if isinstance(value, float):
+                parts.append(f"{key}={value:.3f}s")
+            else:
+                parts.append(f"{key}={value}")
+        print(" ".join(parts), flush=True)
+
     @classmethod
     def _place_aliases(cls, title: str) -> list[str]:
         normalized = normalize_name(title)
@@ -7607,13 +7617,24 @@ class RagService:
         ``천마총(대릉원)``처럼 TourAPI의 복합 장소명이 들어와도 검색용 별칭으로
         ``천마총``을 함께 사용합니다.
         """
+        external_started = time.perf_counter()
         subject = exact_place.title if exact_place is not None else query
         variants = self._external_subject_variants(subject, query)
         if not variants:
+            self._timing_log(
+                "external_sources",
+                total=time.perf_counter() - external_started,
+                heritage=0.0,
+                daum=0.0,
+                fetch=0.0,
+                contexts=0,
+            )
             return []
 
         contexts: list[dict] = []
         seen_urls: set[str] = set()
+
+        heritage_started = time.perf_counter()
 
         # 1) 국가유산청. 괄호가 붙은 TourAPI 명칭 그대로 한 번만 조회하지 않고
         #    정제한 장소명 변형을 순차 조회합니다.
@@ -7637,6 +7658,9 @@ class RagService:
                     break
             if len(contexts) >= 3:
                 break
+
+        heritage_seconds = time.perf_counter() - heritage_started
+        daum_started = time.perf_counter()
 
         # 2) Daum 웹검색. 카카오 문서에 보장되지 않은 site: 연산자에 의존하지 않고
         #    기관명을 검색어에 직접 넣습니다. 첫 검색은 질문 자체를 살려 의도(피장자 등)를
@@ -7711,6 +7735,9 @@ class RagService:
                     "_score": score + source_bonus,
                 })
 
+        daum_seconds = time.perf_counter() - daum_started
+        fetch_started = time.perf_counter()
+
         documents.sort(key=lambda item: int(item.get("_score") or 0), reverse=True)
         fetch_candidates = [
             doc for doc in documents
@@ -7755,6 +7782,22 @@ class RagService:
                 seen_urls.add(url)
             contexts.append(context)
             if len(contexts) >= 5:
+                fetch_seconds = time.perf_counter() - fetch_started
+                self._timing_log(
+                    "external_sources",
+                    total=time.perf_counter() - external_started,
+                    heritage=heritage_seconds,
+                    daum=daum_seconds,
+                    fetch=fetch_seconds,
+                    heritage_contexts=sum(
+                        1
+                        for item in contexts
+                        if str(item.get("source_name") or "").startswith("국가유산")
+                    ),
+                    daum_docs=len(documents),
+                    fetch_candidates=len(fetch_candidates),
+                    contexts=len(contexts[:5]),
+                )
                 return contexts[:5]
 
         # 4) 일부 공공기관은 Railway에서 원문 fetch가 막히거나 첨부/뷰어 URL을
@@ -7780,6 +7823,22 @@ class RagService:
             if len(contexts) >= 5:
                 break
 
+        fetch_seconds = time.perf_counter() - fetch_started
+        self._timing_log(
+            "external_sources",
+            total=time.perf_counter() - external_started,
+            heritage=heritage_seconds,
+            daum=daum_seconds,
+            fetch=fetch_seconds,
+            heritage_contexts=sum(
+                1
+                for item in contexts
+                if str(item.get("source_name") or "").startswith("국가유산")
+            ),
+            daum_docs=len(documents),
+            fetch_candidates=len(fetch_candidates),
+            contexts=len(contexts[:5]),
+        )
         return contexts[:5]
 
     async def _external_fallback_response(
@@ -7788,17 +7847,35 @@ class RagService:
         history: list[ChatTurn],
         exact_place: PlaceRecord | None,
     ) -> RagSearchResponse | None:
+        fallback_started = time.perf_counter()
         contexts = await self._external_official_contexts(query, exact_place)
+        collect_seconds = time.perf_counter() - fallback_started
         if not contexts:
+            self._timing_log(
+                "external_fallback",
+                total=time.perf_counter() - fallback_started,
+                collect=collect_seconds,
+                openai=0.0,
+                contexts=0,
+            )
             return None
 
         # 화면과 모델에 너무 많은 출처를 넘기지 않습니다. 공식성/관련도 순으로 이미 정렬된
         # 상위 3개만 사용하면 답변 집중도와 모바일 UI 가독성이 좋아집니다.
         contexts = contexts[:3]
+        openai_started = time.perf_counter()
         answer = await self.openai.answer_with_context(query, contexts, history=history)
+        openai_seconds = time.perf_counter() - openai_started
         answer = self._clean_external_answer(answer)
         grounded_unknown = self._answer_is_grounded_unknown(answer)
         grounded = grounded_unknown or not self._answer_needs_external_fallback(answer)
+        self._timing_log(
+            "external_fallback",
+            total=time.perf_counter() - fallback_started,
+            collect=collect_seconds,
+            openai=openai_seconds,
+            contexts=len(contexts),
+        )
         return RagSearchResponse(
             query=query,
             answer=answer,
@@ -7812,6 +7889,7 @@ class RagService:
         top_k: int,
         history: list[ChatTurn] | None = None,
     ) -> RagSearchResponse:
+        total_started = time.perf_counter()
         history = history or []
 
         # 의미검색에는 직전 사용자 발화를 보강해 지시어("그거", "거기") 문맥을 살립니다.
@@ -7828,8 +7906,15 @@ class RagService:
         structured_fields = self._structured_fields(query)
 
         if exact_place is not None and structured_fields:
+            structured_started = time.perf_counter()
             exact_place = await self._refresh_place_record(exact_place, structured_fields)
             answer, grounded = self._structured_answer(exact_place, structured_fields)
+            self._timing_log(
+                "search_total",
+                total=time.perf_counter() - total_started,
+                route="structured",
+                structured=time.perf_counter() - structured_started,
+            )
             return RagSearchResponse(
                 query=query,
                 answer=answer,
@@ -7837,7 +7922,10 @@ class RagService:
                 grounded=grounded,
             )
 
+        embedding_started = time.perf_counter()
         vector = (await self.openai.embeddings([search_text]))[0]
+        embedding_seconds = time.perf_counter() - embedding_started
+        retrieval_started = time.perf_counter()
 
         place_records = [record for record in all_place_records if record.embedding]
         doc_records = list(
@@ -7894,13 +7982,28 @@ class RagService:
             key=lambda item: item[0],
             reverse=True,
         )
+        retrieval_seconds = time.perf_counter() - retrieval_started
 
         if not selected or selected[0][0] < self.settings.rag_min_similarity:
             external = await self._external_fallback_response(
                 query, history, exact_place
             )
             if external is not None:
+                self._timing_log(
+                    "search_total",
+                    total=time.perf_counter() - total_started,
+                    route="external_no_internal_hit",
+                    embedding=embedding_seconds,
+                    retrieval=retrieval_seconds,
+                )
                 return external
+            self._timing_log(
+                "search_total",
+                total=time.perf_counter() - total_started,
+                route="ungrounded_no_hit",
+                embedding=embedding_seconds,
+                retrieval=retrieval_seconds,
+            )
             return RagSearchResponse(
                 query=query,
                 answer=(
@@ -7943,15 +8046,33 @@ class RagService:
                     )
                 )
 
+        internal_openai_started = time.perf_counter()
         answer = await self.openai.answer_with_context(query, contexts, history=history)
+        internal_openai_seconds = time.perf_counter() - internal_openai_started
 
         if self._answer_needs_external_fallback(answer):
             external = await self._external_fallback_response(
                 query, history, exact_place
             )
             if external is not None:
+                self._timing_log(
+                    "search_total",
+                    total=time.perf_counter() - total_started,
+                    route="external_after_internal",
+                    embedding=embedding_seconds,
+                    retrieval=retrieval_seconds,
+                    internal_openai=internal_openai_seconds,
+                )
                 return external
 
+        self._timing_log(
+            "search_total",
+            total=time.perf_counter() - total_started,
+            route="internal",
+            embedding=embedding_seconds,
+            retrieval=retrieval_seconds,
+            internal_openai=internal_openai_seconds,
+        )
         return RagSearchResponse(
             query=query,
             answer=answer,
