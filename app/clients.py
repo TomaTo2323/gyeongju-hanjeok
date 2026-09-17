@@ -7,7 +7,6 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
-import xml.etree.ElementTree as ET
 
 import httpx
 
@@ -485,6 +484,80 @@ class TourApiClient(BaseClient):
         return [p for p in places if p is not None]
 
 
+    async def search_festivals(
+        self,
+        travel_date: date,
+        limit: int = 30,
+    ) -> list[Place]:
+        """경주시에서 travel_date에 실제 진행 중인 축제/공연/행사를 조회합니다.
+
+        사용자 위치는 사용하지 않습니다. 경주시 공개 지역코드와 여행 날짜만
+        TourAPI ``searchFestival2``에 전달합니다. API 버전에 따라 지역코드
+        방식이 달라질 수 있어 기존 areaCode/sigunguCode 결과가 비면
+        법정동 코드(경주시 47/130) 방식으로 한 번 더 조회합니다.
+        """
+        ymd = travel_date.strftime("%Y%m%d")
+        common = self._auth_params() | {
+            "eventStartDate": ymd,
+            "eventEndDate": ymd,
+            "arrange": "C",
+            "numOfRows": min(max(1, limit), 100),
+            "pageNo": 1,
+        }
+
+        async def one(params: dict[str, Any]) -> list[dict[str, Any]]:
+            payload = await self._get(
+                "tour_api",
+                f"{self.settings.tour_api_base_url}/searchFestival2",
+                params=params,
+            )
+            return _items(payload)
+
+        legacy_items = await one(
+            common
+            | {
+                "areaCode": self.settings.tour_area_code,
+                "sigunguCode": self.settings.tour_sigungu_code,
+            }
+        )
+
+        ldong_items: list[dict[str, Any]] = []
+        if not legacy_items:
+            ldong_items = await one(
+                common
+                | {
+                    "lDongRegnCd": "47",
+                    "lDongSignguCd": "130",
+                }
+            )
+
+        places: list[Place] = []
+        seen: set[str] = set()
+
+        for item in [*legacy_items, *ldong_items]:
+            place = self._place_from_summary(item)
+            if place is None or place.place_id in seen:
+                continue
+
+            start_text = (place.event_start_date or "").replace("-", "")
+            end_text = (place.event_end_date or "").replace("-", "")
+
+            # API가 범위를 넓게 반환하는 경우에도 해당 날짜에 실제 진행 중인
+            # 행사만 남깁니다. 날짜가 비어 있으면 임의로 추정하지 않습니다.
+            if start_text and ymd < start_text:
+                continue
+            if end_text and ymd > end_text:
+                continue
+
+            seen.add(place.place_id)
+            places.append(place)
+
+            if len(places) >= limit:
+                break
+
+        return places
+
+
     async def keyword_search_global(
         self,
         keyword: str,
@@ -917,14 +990,33 @@ class TourApiClient(BaseClient):
                     )
                     or resolved_place.homepage
                     or place.homepage,
-                "operating_hours":
-                    operating_hours,
                 "rest_date":
                     rest_date,
                 "fee_text":
                     fee_text,
                 "parking":
                     parking,
+                "event_start_date": (
+                    place.event_start_date
+                    or str((place.raw or {}).get("eventstartdate") or "").strip()
+                    or None
+                ),
+                "event_end_date": (
+                    place.event_end_date
+                    or str((place.raw or {}).get("eventenddate") or "").strip()
+                    or None
+                ),
+                "event_place": (
+                    _clean_html(intro.get("eventplace"))
+                    or place.event_place
+                ),
+                # playtime은 실제 응답 원문만 보존합니다. 시간대 해석은
+                # 추천 서비스에서 수행하며, 정보가 없으면 임의 시간을 만들지 않습니다.
+                "operating_hours": (
+                    _clean_html(intro.get("playtime"))
+                    or operating_hours
+                ),
+                "source": place.source or "KTO_TOUR_API",
                 "raw": {
                     "summary":
                         resolved_place.raw
@@ -1072,6 +1164,10 @@ class TourApiClient(BaseClient):
             image_url=item.get("firstimage") or None,
             thumbnail_url=item.get("firstimage2") or None,
             tel=item.get("tel") or None,
+            event_start_date=(str(item.get("eventstartdate") or "").strip() or None),
+            event_end_date=(str(item.get("eventenddate") or "").strip() or None),
+            event_place=(str(item.get("eventplace") or "").strip() or None),
+            source=("KTO_TOUR_API" if content_type == "15" else None),
             raw=item,
         )
 
@@ -1090,48 +1186,6 @@ class GyeongjuOfficialTourClient(BaseClient):
         "search.gyeongju.go.kr",
     }
 
-    # NAVER web search can occasionally return only old /tour_bak pages or no
-    # current official result. Keep a very small deterministic seed map for
-    # critical landmarks whose canonical current Gyeongju Tourism URL is known.
-    # Generic places still use domain-scoped NAVER discovery below.
-    DIRECT_OFFICIAL_URLS: dict[str, tuple[str, ...]] = {
-        "첨성대": (
-            "https://www.gyeongju.go.kr/tour/page.do?area_uid=47&cmd=2&mnu_uid=2292",
-        ),
-    }
-
-    # 경주시 공식 관광 페이지에서 직접 검증한 최소 방문정보 스냅샷입니다.
-    # Railway 등 런타임 환경에서 경주시 홈페이지 요청이 차단/지연되는 경우에도
-    # 핵심 관광지는 "공식 페이지에 값이 분명히 있는 경우"에 한해 안전하게 답합니다.
-    # 이 값들은 일반 웹/블로그가 아니라 아래 source_url의 경주시 공식 페이지 기준입니다.
-    VERIFIED_OFFICIAL_FACTS: dict[str, dict[str, str]] = {
-        "신라왕경숲": {
-            "source_url": "https://www.gyeongju.go.kr/tour/page.do?mnu_uid=4753",
-            "overview": (
-                "신라왕경숲은 신라 시대 왕경지구의 하천 범람을 막기 위해 "
-                "조성했던 오리수를 재현한 숲으로, 산책과 피크닉을 즐기기 좋은 공간입니다."
-            ),
-            "operating_hours": "이용시간 제한 없음",
-            "rest_date": "연중무휴",
-            "parking": "무료 주차장 이용",
-            "address": "경주시 구황동 885-6",
-        },
-        "첨성대": {
-            "source_url": (
-                "https://www.gyeongju.go.kr/tour/"
-                "page.do?area_uid=47&cmd=2&mnu_uid=2292"
-            ),
-            "operating_hours": "09:00 -22:00 (동절기 21:00까지)",
-            "rest_date": "연중무휴",
-            "fee_text": "무료",
-            "parking": (
-                "천마총 노상주차장, 교촌한옥마을 주변 노상주차장, "
-                "쪽샘임시주차장(무료, 원화로181번길 진입)"
-            ),
-            "address": "경북 경주시 인왕동 839-1",
-        },
-    }
-
     FIELD_LABELS: dict[str, tuple[str, ...]] = {
         "operating_hours": (
             "관람시간", "운영시간", "이용시간", "개방시간", "영업시간",
@@ -1143,10 +1197,10 @@ class GyeongjuOfficialTourClient(BaseClient):
             "관람료", "입장료", "이용료", "요금",
         ),
         "parking": (
-            "주차정보", "주차 안내", "주차안내", "주차시설",
+            "주차정보", "주차 안내", "주차안내", "주차",
         ),
         "tel": (
-            "전화번호", "문의 및 안내", "문의전화", "문의처", "전화",
+            "전화", "문의전화", "문의처", "문의",
         ),
         "address": (
             "주소", "위치",
@@ -1232,46 +1286,23 @@ class GyeongjuOfficialTourClient(BaseClient):
         lines: list[str],
         labels: tuple[str, ...],
     ) -> str | None:
-        # 관광 소개 본문 속 단어(예: "주차장에서", "문의가")를
-        # 구조화 필드 라벨로 오인하지 않도록 라인 시작 일치만 허용합니다.
-        known_labels = {
-            label
-            for values in cls.FIELD_LABELS.values()
-            for label in values
-        }
-
         for index, line in enumerate(lines):
-            normalized_line = re.sub(r"^info\.\s*", "", line, flags=re.IGNORECASE).strip()
-
-            for label in sorted(labels, key=len, reverse=True):
-                if not normalized_line.startswith(label):
+            for label in labels:
+                pos = line.find(label)
+                if pos < 0:
                     continue
 
-                tail = normalized_line[len(label):]
-                # "주차장..."처럼 라벨 뒤에 바로 다른 한글이 붙은 본문은 제외합니다.
-                if tail and tail[0] not in " \t:：-·|/":
-                    continue
-
-                value = tail.strip(" \t:：-·|/")
-
+                value = line[pos + len(label):].strip(" \t:：-·|")
                 if not value and index + 1 < len(lines):
-                    next_line = re.sub(r"^info\.\s*", "", lines[index + 1], flags=re.IGNORECASE).strip()
-                    if any(next_line.startswith(item) for item in known_labels):
-                        continue
-                    value = next_line
+                    value = lines[index + 1].strip()
 
-                value = re.sub(r"\s+", " ", value).strip(" \t:：-·|/")
+                # 메뉴/내비게이션에 잡힌 한 단어 라벨은 값으로 쓰지 않습니다.
                 if not value or value == label:
                     continue
 
-                # 구조화 방문정보에 긴 관광 소개 문단이 들어오는 것을 차단합니다.
-                if len(value) > 180:
-                    continue
-                if value.count(".") >= 2 or value.count("다.") >= 2:
-                    continue
-
-                return value
-
+                value = re.sub(r"\s+", " ", value).strip()
+                if 1 <= len(value) <= 500:
+                    return value
         return None
 
     @classmethod
@@ -1313,56 +1344,12 @@ class GyeongjuOfficialTourClient(BaseClient):
         if short_title.startswith("경주 "):
             short_title = short_title[3:].strip()
 
-        # 1) 경주시 공식 페이지에서 이미 검증한 핵심 관광지 스냅샷을 우선 사용합니다.
-        #    외부 사이트가 아니라 경주시 공식 페이지의 최소 방문정보만 저장하며,
-        #    requested_fields에 필요한 값만 반환합니다.
-        compact_title = re.sub(r"[^0-9a-z가-힣]", "", short_title.lower())
-        for known_title, facts in self.VERIFIED_OFFICIAL_FACTS.items():
-            compact_known = re.sub(r"[^0-9a-z가-힣]", "", known_title.lower())
-            if compact_known and (
-                compact_known == compact_title
-                or compact_known in aliases
-                or compact_known in compact_title
-            ):
-                seeded = {
-                    field_name: str(facts[field_name])
-                    for field_name in requested_fields
-                    if facts.get(field_name)
-                }
-                if seeded:
-                    return {
-                        **seeded,
-                        "source_url": facts["source_url"],
-                        "source_name": "경주시 경주문화관광",
-                        "source_mode": "verified_official_snapshot",
-                    }
-
         queries = [
-            f"site:gyeongju.go.kr/tour {short_title}",
-            f"site:www.gyeongju.go.kr/tour/page.do {short_title}",
             f"경주문화관광 {short_title}",
             f"{short_title} 관람시간 경주문화관광",
         ]
 
         candidates: dict[str, dict[str, Any]] = {}
-
-        # Deterministic seed for critical landmarks. NAVER remains the generic
-        # discovery mechanism for the rest, but 첨성대 must not fail merely
-        # because NAVER returns an old /tour_bak page or no current result.
-        for known_title, urls in self.DIRECT_OFFICIAL_URLS.items():
-            compact_known = re.sub(r"[^0-9a-z가-힣]", "", known_title.lower())
-            if compact_known and (
-                compact_known == compact_title
-                or compact_known in aliases
-                or compact_known in compact_title
-            ):
-                for url in urls:
-                    candidates[url] = {
-                        "title": known_title,
-                        "url": url,
-                        "description": "경주시 경주문화관광 공식 페이지",
-                        "score": 3000,
-                    }
         for query in queries:
             try:
                 documents = await self.naver.web_documents(query, limit=10)
@@ -1403,38 +1390,20 @@ class GyeongjuOfficialTourClient(BaseClient):
         best_score = -1
         for candidate in ranked:
             url = str(candidate.get("url") or "")
-            raw_html = ""
             try:
                 raw_html = await asyncio.wait_for(self._get_text(url), timeout=4.0)
             except (IntegrationError, asyncio.TimeoutError):
-                # Railway에서 경주시 홈페이지 본문 직접 요청이 실패할 수 있습니다.
-                # 이 경우에도 "공식 도메인 검색결과"의 제목/설명만 마지막 보조근거로
-                # 사용합니다. 비공식 도메인은 candidates 단계에서 이미 제외됩니다.
-                raw_html = ""
+                continue
 
-            if raw_html:
-                compact_page = re.sub(
-                    r"[^0-9a-z가-힣]",
-                    "",
-                    html.unescape(re.sub(r"(?is)<[^>]+>", " ", raw_html)).lower(),
-                )
-                if aliases and not any(alias in compact_page for alias in aliases):
-                    continue
-                fields = self._parse_fields(raw_html, requested_fields)
-            else:
-                snippet = (
-                    f"{candidate.get('title', '')}\n"
-                    f"{candidate.get('description', '')}"
-                )
-                compact_snippet = re.sub(
-                    r"[^0-9a-z가-힣]",
-                    "",
-                    html.unescape(re.sub(r"(?is)<[^>]+>", " ", snippet)).lower(),
-                )
-                if aliases and not any(alias in compact_snippet for alias in aliases):
-                    continue
-                fields = self._parse_fields(snippet, requested_fields)
+            compact_page = re.sub(
+                r"[^0-9a-z가-힣]",
+                "",
+                html.unescape(re.sub(r"(?is)<[^>]+>", " ", raw_html)).lower(),
+            )
+            if aliases and not any(alias in compact_page for alias in aliases):
+                continue
 
+            fields = self._parse_fields(raw_html, requested_fields)
             if not fields:
                 continue
 
@@ -1448,363 +1417,6 @@ class GyeongjuOfficialTourClient(BaseClient):
                 }
 
         return best
-
-
-class KoreanHeritageClient(BaseClient):
-    """국가유산청 공개 Open API에서 국가유산 설명을 조회합니다.
-
-    국가유산청의 목록/상세 XML endpoint는 별도 API key 없이 공개되어 있습니다.
-    운영시간·요금이 아니라 역사·유래·시대·소재지 같은 공식 설명을 보강하는 용도입니다.
-    """
-
-    LIST_URL = "https://www.khs.go.kr/cha/SearchKindOpenapiList.do"
-    DETAIL_URL = "https://www.khs.go.kr/cha/SearchKindOpenapiDt.do"
-
-    async def _get_xml(self, url: str, *, params: dict[str, Any]) -> str:
-        try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout,
-                follow_redirects=True,
-                headers={
-                    "User-Agent": "GyeongjuHanjeok/1.0 (official heritage lookup)",
-                },
-            ) as client:
-                response = await client.get(url, params=params)
-                response.raise_for_status()
-                return response.text
-        except httpx.HTTPStatusError as exc:
-            raise IntegrationError(
-                "korean_heritage",
-                f"HTTP {exc.response.status_code}: {exc.response.text[:300]}",
-                status_code=exc.response.status_code,
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise IntegrationError("korean_heritage", str(exc)) from exc
-
-    @staticmethod
-    def _local_xml_name(tag: object) -> str:
-        text = str(tag or "")
-        if "}" in text:
-            text = text.rsplit("}", 1)[-1]
-        return text.lower()
-
-    @classmethod
-    def _xml_value(cls, item: ET.Element | None, name: str) -> str:
-        """Read KHS XML fields case-insensitively and across minor schema variants.
-
-        The heritage Open API has existed for many years and examples in the wild
-        include both camelCase and lower-case tag names. ElementTree's ``find`` is
-        case-sensitive, so a response such as ``<ccbamnm1>`` would otherwise look
-        empty even though the value is present. We also search descendants so
-        nested ``<ccbaCndt><content>...`` descriptions are usable.
-        """
-        if item is None:
-            return ""
-        wanted = name.lower()
-        for node in item.iter():
-            if cls._local_xml_name(node.tag) != wanted:
-                continue
-            value = " ".join(part.strip() for part in node.itertext() if part and part.strip())
-            value = re.sub(r"\s+", " ", value).strip()
-            if value:
-                return value
-        return ""
-
-    @classmethod
-    def _xml_items(cls, root: ET.Element) -> list[ET.Element]:
-        return [node for node in root.iter() if cls._local_xml_name(node.tag) == "item"]
-
-    @staticmethod
-    def _compact(value: str) -> str:
-        return re.sub(r"[^0-9a-z가-힣]", "", value.lower())
-
-    @classmethod
-    def _candidate_score(cls, item: ET.Element, query: str) -> int:
-        name = cls._xml_value(item, "ccbaMnm1")
-        province = cls._xml_value(item, "ccbaCtcdNm")
-        district = cls._xml_value(item, "ccsiName")
-        compact_query = cls._compact(query)
-        compact_name = cls._compact(name)
-
-        score = 0
-        if compact_name == compact_query:
-            score += 200
-        elif compact_query and compact_query in compact_name:
-            score += 120
-        elif compact_name and compact_name in compact_query:
-            score += 80
-
-        if "경주" in district:
-            score += 40
-        if "경북" in province or "경상북도" in province:
-            score += 20
-        if cls._xml_value(item, "ccbaCncl").upper() == "Y":
-            score -= 500
-        return score
-
-    async def contexts(self, title: str, *, limit: int = 2) -> list[dict[str, Any]]:
-        short_title = title.strip()
-        if short_title.startswith("경주 "):
-            short_title = short_title[3:].strip()
-        if not short_title:
-            return []
-
-        raw = await self._get_xml(
-            self.LIST_URL,
-            params={
-                "ccbaMnm1": short_title,
-                "pageUnit": 20,
-                "pageIndex": 1,
-                "ccbaCncl": "N",
-            },
-        )
-        try:
-            root = ET.fromstring(raw)
-        except ET.ParseError as exc:
-            raise IntegrationError("korean_heritage", f"invalid XML: {exc}") from exc
-
-        candidates = sorted(
-            (
-                (self._candidate_score(item, short_title), item)
-                for item in self._xml_items(root)
-            ),
-            key=lambda pair: pair[0],
-            reverse=True,
-        )
-        candidates = [pair for pair in candidates if pair[0] > 0][: max(limit * 2, 4)]
-
-        results: list[dict[str, Any]] = []
-        for _, item in candidates:
-            kind = self._xml_value(item, "ccbaKdcd")
-            number = self._xml_value(item, "ccbaAsno")
-            province_code = self._xml_value(item, "ccbaCtcd")
-            if not (kind and number and province_code):
-                continue
-
-            # A detail endpoint outage should not throw away a useful list result.
-            # The list response itself often contains period/address/content fields.
-            detail: ET.Element | None = None
-            try:
-                detail_raw = await self._get_xml(
-                    self.DETAIL_URL,
-                    params={
-                        "ccbaKdcd": kind,
-                        "ccbaAsno": number,
-                        "ccbaCtcd": province_code,
-                    },
-                )
-                detail_root = ET.fromstring(detail_raw)
-                detail_items = self._xml_items(detail_root)
-                detail = detail_items[0] if detail_items else None
-            except (IntegrationError, ET.ParseError, ValueError):
-                detail = None
-
-            source = detail if detail is not None else item
-            name = self._xml_value(source, "ccbaMnm1") or self._xml_value(item, "ccbaMnm1")
-            content = self._xml_value(source, "content") or self._xml_value(item, "content")
-            fields = [
-                ("국가유산 종목", self._xml_value(source, "ccmaName") or self._xml_value(item, "ccmaName")),
-                ("시대", self._xml_value(source, "ccceName") or self._xml_value(item, "ccceName")),
-                ("소재지", self._xml_value(source, "ccbaLcad") or self._xml_value(item, "ccbaLcad")),
-                ("관리자", self._xml_value(source, "ccbaAdmin") or self._xml_value(item, "ccbaAdmin")),
-            ]
-            prefix = " / ".join(f"{label}: {value}" for label, value in fields if value)
-            overview = "\n".join(part for part in (prefix, content) if part).strip()
-            if not overview:
-                continue
-
-            cpno = self._xml_value(source, "ccbaCpno") or self._xml_value(item, "ccbaCpno")
-            if cpno:
-                source_url = (
-                    "https://m.khs.go.kr/public/commentary/culSelectDetail.do"
-                    f"?ccbaAsno={number}&ccbaCpno={cpno}&ccbaCtcd={province_code}"
-                    f"&ccbaKdcd={kind}&menuId=03"
-                )
-            else:
-                source_url = (
-                    f"{self.DETAIL_URL}?ccbaKdcd={kind}&ccbaAsno={number}&ccbaCtcd={province_code}"
-                )
-            results.append(
-                {
-                    "title": f"국가유산청 - {name}",
-                    "category": "국가유산 공식자료",
-                    "overview": overview[:8000],
-                    "homepage": source_url,
-                    "source_url": source_url,
-                    "source_name": "국가유산청",
-                }
-            )
-            if len(results) >= limit:
-                break
-        return results
-
-
-class DaumSearchClient(BaseClient):
-    """Kakao REST API key를 사용한 Daum 웹문서 검색."""
-
-    BASE_URL = "https://dapi.kakao.com/v2/search/web"
-
-    async def web_documents(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
-        if not self.settings.kakao_rest_api_key:
-            raise IntegrationError(
-                "daum_search",
-                "KAKAO_REST_API_KEY가 설정되지 않았습니다.",
-                status_code=503,
-            )
-        payload = await self._get(
-            "daum_search",
-            self.BASE_URL,
-            params={
-                "query": query,
-                "sort": "accuracy",
-                "page": 1,
-                "size": max(1, min(int(limit), 50)),
-            },
-            headers={"Authorization": f"KakaoAK {self.settings.kakao_rest_api_key}"},
-        )
-        documents = payload.get("documents")
-        return documents if isinstance(documents, list) else []
-
-
-class TrustedWebSourceClient(BaseClient):
-    """Daum 검색으로 발견한 신뢰 도메인의 원문만 직접 읽습니다.
-
-    검색 스니펫 자체를 정답 근거로 사용하지 않고, 허용된 공공기관/국립기관
-    도메인의 원문을 다시 받아 RAG 컨텍스트로 사용합니다.
-    """
-
-    TRUSTED_DOMAINS: dict[str, str] = {
-        "khs.go.kr": "국가유산청",
-        "heritage.go.kr": "국가유산포털",
-        "nrich.go.kr": "국립문화유산연구원",
-        "museum.go.kr": "국립중앙박물관",
-        "gyeongju.museum.go.kr": "국립경주박물관",
-        "gyeongju.go.kr": "경주시",
-        "visitkorea.or.kr": "대한민국 구석구석",
-    }
-
-    @classmethod
-    def _domain_match(cls, host: str) -> tuple[str, str] | None:
-        host = host.lower().strip(".")
-        for domain, source_name in sorted(
-            cls.TRUSTED_DOMAINS.items(),
-            key=lambda item: len(item[0]),
-            reverse=True,
-        ):
-            if host == domain or host.endswith("." + domain):
-                return domain, source_name
-        return None
-
-    @classmethod
-    def trusted_source_name(cls, url: str) -> str | None:
-        try:
-            parsed = urlparse(url)
-        except ValueError:
-            return None
-        if parsed.scheme not in {"http", "https"}:
-            return None
-        match = cls._domain_match(parsed.hostname or "")
-        return match[1] if match else None
-
-    @staticmethod
-    def _tokens(text: str) -> list[str]:
-        stop = {
-            "알려줘", "알려", "어디", "어떤", "무엇", "뭐야", "누구", "경주",
-            "대해", "대한", "정보", "설명", "관광", "관련",
-        }
-        tokens = [token.lower() for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", text)]
-        return list(dict.fromkeys(token for token in tokens if token not in stop))
-
-    @classmethod
-    def _extract_relevant_text(cls, raw_html: str, *, query: str, title: str) -> str:
-        text = re.sub(
-            r"(?is)<(?:script|style|noscript|svg|nav|footer|form)[^>]*>.*?</(?:script|style|noscript|svg|nav|footer|form)>",
-            " ",
-            raw_html,
-        )
-        text = re.sub(
-            r"(?is)<br\s*/?>|</(?:p|div|li|tr|td|th|dd|dt|section|article|h[1-6])>",
-            "\n",
-            text,
-        )
-        text = html.unescape(re.sub(r"(?is)<[^>]+>", " ", text)).replace("\xa0", " ")
-
-        lines: list[str] = []
-        seen: set[str] = set()
-        for raw_line in text.splitlines():
-            line = re.sub(r"\s+", " ", raw_line).strip(" \t:-·|")
-            if len(line) < 15 or len(line) > 900 or line in seen:
-                continue
-            seen.add(line)
-            lines.append(line)
-
-        if not lines:
-            return ""
-
-        tokens = cls._tokens(f"{title} {query}")
-        title_compact = re.sub(r"[^0-9a-z가-힣]", "", title.lower())
-        scored: list[tuple[int, int, str]] = []
-        for index, line in enumerate(lines):
-            compact = re.sub(r"[^0-9a-z가-힣]", "", line.lower())
-            score = 0
-            if title_compact and title_compact in compact:
-                score += 50
-            for token in tokens:
-                if token in line.lower():
-                    score += min(len(token), 8) * 3
-            scored.append((score, index, line))
-
-        top_indices = {
-            index
-            for score, index, _ in sorted(scored, reverse=True)[:18]
-            if score > 0
-        }
-        if not top_indices:
-            selected = lines[:18]
-        else:
-            expanded = set(top_indices)
-            for index in list(top_indices):
-                if index > 0:
-                    expanded.add(index - 1)
-                if index + 1 < len(lines):
-                    expanded.add(index + 1)
-            selected = [lines[index] for index in sorted(expanded)[:30]]
-
-        return "\n".join(selected)[:8000]
-
-    async def fetch_document(self, url: str, *, query: str, title: str) -> dict[str, Any] | None:
-        source_name = self.trusted_source_name(url)
-        if not source_name:
-            return None
-        try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout,
-                follow_redirects=True,
-                headers={"User-Agent": "GyeongjuHanjeok/1.0 (trusted source RAG)"},
-            ) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                final_url = str(response.url)
-                final_source_name = self.trusted_source_name(final_url)
-                if not final_source_name:
-                    return None
-                content_type = (response.headers.get("content-type") or "").lower()
-                if not any(kind in content_type for kind in ("text/html", "text/plain", "application/xhtml")):
-                    return None
-                overview = self._extract_relevant_text(response.text, query=query, title=title)
-        except (httpx.HTTPError, ValueError):
-            return None
-
-        if not overview:
-            return None
-        return {
-            "title": f"{final_source_name} - {title}",
-            "category": "공식 웹자료",
-            "overview": overview,
-            "homepage": final_url,
-            "source_url": final_url,
-            "source_name": final_source_name,
-        }
 
 
 class RegionalVisitorClient(BaseClient):
@@ -3642,6 +3254,7 @@ class OpenAIClient(BaseClient):
                         _line("유모차", c.get("stroller_info")),
                         _line("반려동물 동반", c.get("pet_info")),
                         _line("카드결제", c.get("credit_card_info")),
+                        _line("홈페이지", c.get("homepage")),
                     ],
                 )
             )
@@ -3664,12 +3277,10 @@ class OpenAIClient(BaseClient):
                     "content": (
                         "당신은 경주 관광 안내 챗봇입니다. 아래 [제목]이 붙은 자료만 근거로 한국어로 답하세요.\n"
                         "- 자료에 없는 사실은 절대로 지어내지 말고, 그 부분은 확인할 수 없다고 명시하세요.\n"
-                        "- 질문에 답할 만한 자료가 정말 없을 때만 \"확인할 수 있는 자료가 부족합니다\"라고 답하세요.\n"
-                        "- 공식 자료가 피장자·연대·정설 등을 '미상', '알 수 없음', '밝혀지지 않음'처럼 명시하면, "
-                        "그 사실 자체가 근거 있는 답변입니다. 이 경우 '자료가 부족하다'고 표시하지 마세요.\n"
-                        "- URL은 답변 본문에 직접 쓰거나 나열하지 마세요. 출처 링크는 앱의 참고자료 UI가 별도로 보여줍니다.\n"
-                        "- 답변 근거로 실제 사용한 자료 제목만 대괄호로 표시하고, 최대 3개까지만 인용하세요.\n"
-                        "- 사용자가 바로 이해할 수 있도록 먼저 핵심 답을 1~3문장으로 말하고, 불필요한 원문 링크 목록이나 장황한 안내는 붙이지 마세요.\n"
+                        "- 질문에 답할 만한 자료가 부족하면 억지로 답하지 말고 "
+                        "\"확인할 수 있는 자료가 부족합니다\"라고 답하세요. "
+                        "이때 자료에 홈페이지 주소가 있으면 거기서 확인해보라고 안내하세요.\n"
+                        "- 답변 근거로 사용한 자료는 대괄호 안 제목 그대로 표시하세요 (예: [경주 동궁과 월지]).\n"
                         "- 특정 국가·인종·종교 집단 전체를 일반화하는 발언은 하지 마세요. 역사적 국제교류는 "
                         "구체적인 유물·유적 사실로만 설명하고, 학계에서 이견이 있는 내용은 정설처럼 "
                         "단정하지 말고 자료에 적힌 대로 이견이 있다는 점을 함께 전하세요.\n"
@@ -3680,14 +3291,7 @@ class OpenAIClient(BaseClient):
                 *history_messages,
                 {"role": "user", "content": f"질문: {query}\n\n참고 자료:\n{context_text}"},
             ],
-            "max_output_tokens": 300,
         }
-
-        # 검색/근거 선택은 그대로 두고 최종 문장 생성 단계만 저지연으로 설정합니다.
-        if str(self.settings.openai_model).lower().startswith("gpt-5"):
-            body["reasoning"] = {"effort": "minimal"}
-            body["text"] = {"verbosity": "low"}
-
         # RAG 컨텍스트(관광지+지식 문서)가 늘어날수록 모델이 답을 만드는 데 걸리는 시간도
         # 길어져서, 다른 API 호출에 쓰는 기본 20초 타임아웃으로는 가끔 502가 났다.
         # 이 호출만 넉넉하게 60초로 늘린다.
@@ -3697,26 +3301,8 @@ class OpenAIClient(BaseClient):
             json_body=body,
             headers=self.headers,
             timeout_seconds=60.0,
-        )
-
-        usage = payload.get("usage") or {}
-        output_details = usage.get("output_tokens_details") or {}
-        print(
-            "RAG-TIMING stage=openai_usage "
-            f"model={self.settings.openai_model} "
-            f"input_tokens={usage.get('input_tokens', 0)} "
-            f"output_tokens={usage.get('output_tokens', 0)} "
-            f"reasoning_tokens={output_details.get('reasoning_tokens', 0)}",
-            flush=True,
-        )
-
-        answer = _extract_openai_text(payload)
-        # 원문 URL은 참고자료 UI에서 처리하므로 답변 본문에서는 제거합니다.
-        answer = re.sub(r"(?m)^\s*[-•]?\s*https?://\S+\s*$", "", answer)
-        answer = re.sub(r"https?://[^\s)\]]+", "", answer)
-        answer = re.sub(r"[ \t]+\n", "\n", answer)
-        answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
-        return answer
+)
+        return _extract_openai_text(payload)
 
     async def embeddings(self, texts: list[str]) -> list[list[float]]:
         if not texts:

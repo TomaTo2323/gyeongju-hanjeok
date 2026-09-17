@@ -4,7 +4,7 @@ import asyncio
 import math
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from urllib.parse import urlparse
 
@@ -14,9 +14,6 @@ from sqlalchemy.orm import Session
 from .clients import (
     CongestionClient,
     GyeongjuOfficialTourClient,
-    KoreanHeritageClient,
-    DaumSearchClient,
-    TrustedWebSourceClient,
     IntegrationError,
     KakaoLocalClient,
     KakaoRouteClient,
@@ -265,6 +262,9 @@ PREFERENCE_KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
     "야경": (
         "야경", "월정교", "동궁", "월지", "첨성대", "보문", "야간", "빛",
+    ),
+    "행사": (
+        "축제", "행사", "공연", "페스티벌", "이벤트", "문화행사",
     ),
     "체험": (
         "체험", "공방", "마을", "전통", "한복", "레포츠",
@@ -1348,6 +1348,7 @@ def _progressive_route_individual(
         if (
             preference.strip().lower()
             not in FOOD_PREFERENCES
+            and preference.strip().lower() != "행사"
         )
     ]
 
@@ -2373,6 +2374,20 @@ def recommended_stay_minutes(
         or ""
     )
 
+    # 행사는 공식 종료시각이 있으면 실제 지속시간을 우선하고,
+    # 시간이 없으면 코스 내부 계산용으로만 90분을 사용합니다.
+    if content_type_id == "15":
+        if place.event_start_time and place.event_end_time:
+            start_min = _clock_text_to_minutes(place.event_start_time)
+            end_min = _clock_text_to_minutes(place.event_end_time)
+            if (
+                start_min is not None
+                and end_min is not None
+                and end_min > start_min
+            ):
+                return max(30, min(180, end_min - start_min))
+        return 90
+
     # 여행코스 자체는 짧은 단일 관광지보다 오래 머무는 편.
     if content_type_id == "25":
         return 120
@@ -2921,6 +2936,398 @@ async def _gyeongju_route_pool(
     return cleaned
 
 
+# ---------------------------------------------------------------------------
+# 행사/축제 후보 캐시 및 시간 메타데이터
+# ---------------------------------------------------------------------------
+
+_FESTIVAL_ROUTE_CACHE: dict[str, tuple[float, list[Place]]] = {}
+_FESTIVAL_ROUTE_TTL_SECONDS = 30 * 60
+
+
+def _event_clock_pair(text: str | None) -> tuple[str | None, str | None, str]:
+    """TourAPI playtime/운영시간 원문에서 확인 가능한 시각만 추출합니다.
+
+    반환 type:
+      fixed    - 단일 시작시각 또는 공연/개막/시작 의미가 명시된 시간
+      flexible - 운영시간 범위로 보이는 시간대
+      unknown  - 시각을 확인할 수 없음
+
+    날짜만 있는 행사는 시간을 만들어내지 않습니다. ``18시~20시``와
+    ``18:00~20:00``처럼 실제 원문에 있는 시각 표현만 정규화합니다.
+    """
+    raw = re.sub(r"\s+", " ", text or "").strip()
+    if not raw:
+        return None, None, "unknown"
+
+    def korean_clock(match: re.Match[str]) -> str:
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        return f"{hour:02d}:{minute:02d}"
+
+    normalized = re.sub(
+        r"(?<!\d)([01]?\d|2[0-3])\s*시(?:\s*([0-5]?\d)\s*분)?",
+        korean_clock,
+        raw,
+    )
+
+    range_match = re.search(
+        r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)"
+        r"\s*(?:~|[-–—]|부터)\s*"
+        r"([01]?\d|2[0-3]):([0-5]\d)",
+        normalized,
+    )
+
+    if range_match:
+        sh = int(range_match.group(1))
+        sm = int(range_match.group(2))
+        eh = int(range_match.group(3))
+        em = int(range_match.group(4))
+        start_text = f"{sh:02d}:{sm:02d}"
+        end_text = f"{eh:02d}:{em:02d}"
+        fixed_hint = any(
+            token in raw
+            for token in (
+                "공연시간", "공연 시간", "공연시작", "공연 시작",
+                "개막", "시작시간", "시작 시간", "상영",
+            )
+        )
+        return start_text, end_text, "fixed" if fixed_hint else "flexible"
+
+    single = re.search(
+        r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)",
+        normalized,
+    )
+    if single:
+        hour = int(single.group(1))
+        minute = int(single.group(2))
+        return f"{hour:02d}:{minute:02d}", None, "fixed"
+
+    return None, None, "unknown"
+
+def _prepare_event_place(place: Place) -> Place:
+    copied = place.model_copy(deep=True)
+    start_time, end_time, time_type = _event_clock_pair(
+        copied.operating_hours
+    )
+    copied.event_start_time = copied.event_start_time or start_time
+    copied.event_end_time = copied.event_end_time or end_time
+    copied.event_time_type = copied.event_time_type or time_type
+    copied.source = copied.source or "KTO_TOUR_API"
+    return copied
+
+
+def _event_anchor_datetime(
+    place: Place,
+    travel_day: date,
+    *,
+    end: bool = False,
+) -> datetime | None:
+    value = place.event_end_time if end else place.event_start_time
+    if not value:
+        return None
+    parsed = _clock_text_to_minutes(value)
+    if parsed is None:
+        return None
+    return datetime(
+        travel_day.year,
+        travel_day.month,
+        travel_day.day,
+        parsed // 60,
+        parsed % 60,
+        tzinfo=KST,
+    )
+
+
+async def _gyeongju_festival_pool(
+    tour: TourApiClient,
+    travel_day: date,
+) -> list[Place]:
+    """여행 날짜의 경주 행사 후보를 캐시 우선으로 조회합니다.
+
+    TourAPI 장애/429가 발생했을 때 같은 날짜의 이전 성공 캐시가 있으면
+    stale cache를 사용하고, 없으면 호출자에게 IntegrationError를 전달합니다.
+    """
+    key = travel_day.isoformat()
+    now = time.monotonic()
+    cached = _FESTIVAL_ROUTE_CACHE.get(key)
+
+    if cached is not None:
+        cached_at, places = cached
+        if now - cached_at < _FESTIVAL_ROUTE_TTL_SECONDS:
+            return [place.model_copy(deep=True) for place in places]
+
+    stale_places = cached[1] if cached is not None else []
+
+    try:
+        summaries = await tour.search_festivals(
+            travel_day,
+            limit=30,
+        )
+    except IntegrationError:
+        if stale_places:
+            return [place.model_copy(deep=True) for place in stale_places]
+        raise
+
+    # 시간/행사장/요금이 필요한 상위 후보만 상세조회합니다.
+    # 실패하면 summary를 그대로 사용하여 가짜 시간을 생성하지 않습니다.
+    async def detail_one(place: Place) -> Place:
+        try:
+            detailed = await asyncio.wait_for(
+                tour.detail(place),
+                timeout=2.8,
+            )
+            return _prepare_event_place(detailed)
+        except (IntegrationError, asyncio.TimeoutError, Exception):
+            return _prepare_event_place(place)
+
+    detailed_head = await asyncio.gather(
+        *(detail_one(place) for place in summaries[:6])
+    ) if summaries else []
+
+    by_id: dict[str, Place] = {
+        place.place_id: place
+        for place in detailed_head
+    }
+
+    places = [
+        by_id.get(place.place_id, _prepare_event_place(place))
+        for place in summaries
+    ]
+
+    # 동일 contentId 중복 제거
+    deduped = list({place.place_id: place for place in places}.values())
+
+    _FESTIVAL_ROUTE_CACHE[key] = (
+        now,
+        [place.model_copy(deep=True) for place in deduped],
+    )
+
+    return deduped
+
+
+def _event_candidate_score(
+    event: Place,
+    route: list[Place],
+    req: RecommendRequest,
+    start: datetime,
+) -> float:
+    if req.free_only and event.is_free is False:
+        return -1_000_000.0
+
+    route_distance = min(
+        (
+            haversine_km(
+                event.latitude,
+                event.longitude,
+                place.latitude,
+                place.longitude,
+            )
+            for place in route
+        ),
+        default=haversine_km(
+            req.latitude,
+            req.longitude,
+            event.latitude,
+            event.longitude,
+        ),
+    )
+
+    # 도보는 먼 행사를 강하게 감점하고 자동차는 더 넓게 허용합니다.
+    distance_penalty = route_distance * {
+        TransportMode.walking: 16.0,
+        TransportMode.public_transport: 8.0,
+        TransportMode.driving: 4.0,
+    }.get(req.transport, 8.0)
+
+    score = 100.0 - distance_penalty
+
+    fixed_start = _event_anchor_datetime(
+        event,
+        start.date(),
+    )
+    window_end = _event_anchor_datetime(
+        event,
+        start.date(),
+        end=True,
+    )
+
+    trip_end = start + timedelta(minutes=req.available_minutes)
+
+    if fixed_start is not None:
+        if event.event_time_type == "fixed" and fixed_start < start:
+            return -1_000_000.0
+        if fixed_start > trip_end:
+            return -1_000_000.0
+
+        if event.event_time_type == "fixed":
+            # 종료시각까지 확인된 고정 행사는 전체 행사시간이 사용자의
+            # 여행 가능시간 안에 들어오는 경우만 후보로 둡니다.
+            if window_end is not None and window_end > trip_end:
+                return -1_000_000.0
+
+            if window_end is None:
+                internal_end = fixed_start + timedelta(
+                    minutes=recommended_stay_minutes(event)
+                )
+                if internal_end > trip_end:
+                    return -1_000_000.0
+
+        score += 18.0
+
+    if window_end is not None and window_end <= start:
+        return -1_000_000.0
+
+    if event.event_time_type == "flexible":
+        visit_start = max(
+            start,
+            fixed_start or start,
+        )
+        visit_end_limit = min(
+            trip_end,
+            window_end or trip_end,
+        )
+        if (
+            visit_start
+            + timedelta(
+                minutes=min(
+                    60,
+                    max(
+                        30,
+                        recommended_stay_minutes(event),
+                    ),
+                )
+            )
+            > visit_end_limit
+        ):
+            return -1_000_000.0
+
+    if event.is_free is True:
+        score += 4.0
+
+    return score
+
+
+def _event_insertion_index(
+    route: list[Place],
+    event: Place,
+    req: RecommendRequest,
+    start: datetime,
+) -> int | None:
+    if not route:
+        return 0
+
+    anchor = _event_anchor_datetime(
+        event,
+        start.date(),
+    )
+    window_end = _event_anchor_datetime(
+        event,
+        start.date(),
+        end=True,
+    )
+    fixed = event.event_time_type == "fixed" and anchor is not None
+
+    best: tuple[float, int] | None = None
+
+    for insert_at in range(0, len(route) + 1):
+        test_route = [*route]
+        test_route.insert(insert_at, event)
+        current = start
+        previous = (req.latitude, req.longitude)
+        event_arrival: datetime | None = None
+
+        for place in test_route:
+            km = haversine_km(
+                previous[0],
+                previous[1],
+                place.latitude,
+                place.longitude,
+            )
+            current += timedelta(
+                minutes=_estimate_minutes(km, req.transport)
+            )
+
+            if place.place_id == event.place_id:
+                event_arrival = current
+                break
+
+            current += timedelta(
+                minutes=recommended_stay_minutes(place)
+            )
+            previous = (place.latitude, place.longitude)
+
+        if event_arrival is None:
+            continue
+
+        # 고정 시작 행사는 15분 전까지 도착 가능한 경우만 허용합니다.
+        if fixed:
+            latest = anchor - timedelta(minutes=15)
+            if event_arrival > latest:
+                continue
+
+            trip_end = start + timedelta(
+                minutes=req.available_minutes
+            )
+            if window_end is not None:
+                if window_end > trip_end:
+                    continue
+            elif (
+                anchor
+                + timedelta(
+                    minutes=recommended_stay_minutes(event)
+                )
+                > trip_end
+            ):
+                continue
+
+            wait_minutes = max(
+                0.0,
+                (anchor - event_arrival).total_seconds() / 60.0,
+            )
+            time_penalty = wait_minutes * 0.25
+        else:
+            # 운영시간 범위는 그 안에서 방문 가능한 위치만 허용합니다.
+            if window_end is not None:
+                minimum_stay = min(60, recommended_stay_minutes(event))
+                if event_arrival + timedelta(minutes=minimum_stay) > window_end:
+                    continue
+            if anchor is not None and event_arrival < anchor:
+                time_penalty = (
+                    anchor - event_arrival
+                ).total_seconds() / 60.0 * 0.08
+            else:
+                time_penalty = 0.0
+
+        prev_coord = (
+            (req.latitude, req.longitude)
+            if insert_at == 0
+            else (route[insert_at - 1].latitude, route[insert_at - 1].longitude)
+        )
+        next_place = route[insert_at] if insert_at < len(route) else None
+        detour = haversine_km(
+            prev_coord[0], prev_coord[1], event.latitude, event.longitude
+        )
+        if next_place is not None:
+            detour += haversine_km(
+                event.latitude, event.longitude,
+                next_place.latitude, next_place.longitude,
+            )
+            detour -= haversine_km(
+                prev_coord[0], prev_coord[1],
+                next_place.latitude, next_place.longitude,
+            )
+
+        position_penalty = abs(
+            insert_at / max(1, len(route)) - 0.68
+        ) * 6.0
+        score = detour * 8.0 + time_penalty + position_penalty
+
+        if best is None or score < best[0]:
+            best = (score, insert_at)
+
+    return None if best is None else best[1]
+
+
 class RecommendationService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -2952,6 +3359,28 @@ class RecommendationService:
             req.start_time
             or datetime.now(KST)
         ).astimezone(KST)
+
+        event_requested = any(
+            value.strip() == "행사"
+            for value in req.preferences
+        )
+        event_candidates: list[Place] = []
+        event_lookup_failed = False
+
+        if event_requested:
+            try:
+                event_candidates = await asyncio.wait_for(
+                    _gyeongju_festival_pool(
+                        self.tour,
+                        start.date(),
+                    ),
+                    timeout=5.5,
+                )
+            except (IntegrationError, asyncio.TimeoutError):
+                event_lookup_failed = True
+                if "festival_api" not in unavailable:
+                    unavailable.append("festival_api")
+                event_candidates = []
 
         # 1. 경주시 전체 관광지 후보 풀
         # 출발지 주변 locationBasedList 결과에 의존하지 않습니다.
@@ -3522,6 +3951,20 @@ class RecommendationService:
             weather,
         )
 
+        if event_requested:
+            if event_candidates:
+                applied.append(
+                    f"{start.date().isoformat()} 진행 행사 후보 {len(event_candidates)}건 확인"
+                )
+            elif event_lookup_failed:
+                applied.append(
+                    "행사 API 확인 실패: 기존 관광지 코스로 fallback"
+                )
+            else:
+                applied.append(
+                    "선택한 날짜에 이용 가능한 행사 없음: 기존 테마 중심 fallback"
+                )
+
         attraction_candidates = [
             place
             for place in candidates
@@ -3952,6 +4395,7 @@ class RecommendationService:
                 unavailable,
                 food_candidates=food_candidates,
                 cafe_candidates=cafe_candidates,
+                event_candidates=event_candidates,
             )
 
             courses.append(course)
@@ -4589,6 +5033,7 @@ class RecommendationService:
         *,
         food_candidates: list[Place] | None = None,
         cafe_candidates: list[Place] | None = None,
+        event_candidates: list[Place] | None = None,
     ) -> Course:
         route = [
             places[index].model_copy(deep=True)
@@ -4615,6 +5060,44 @@ class RecommendationService:
                 *day_places,
                 *night_places,
             ]
+
+        event_candidates = event_candidates or []
+        chosen_event: Place | None = None
+        event_requested = any(
+            value.strip() == "행사"
+            for value in req.preferences
+        )
+
+        if event_requested and event_candidates:
+            ranked_events = sorted(
+                event_candidates,
+                key=lambda event: _event_candidate_score(
+                    event, route, req, start
+                ),
+                reverse=True,
+            )
+
+            for event in ranked_events:
+                if _event_candidate_score(
+                    event, route, req, start
+                ) < -1000:
+                    continue
+
+                insert_at = _event_insertion_index(
+                    route,
+                    event,
+                    req,
+                    start,
+                )
+                if insert_at is None:
+                    continue
+
+                chosen_event = event.model_copy(deep=True)
+                chosen_event.category = "축제·공연"
+                chosen_event.raw = dict(chosen_event.raw or {})
+                chosen_event.raw["route_event_anchor"] = True
+                route.insert(insert_at, chosen_event)
+                break
 
         food_candidates = food_candidates or []
         cafe_candidates = cafe_candidates or []
@@ -5157,12 +5640,207 @@ class RecommendationService:
                     "fallback": True,
                 }
 
-        segment_results = await asyncio.gather(
-            *(
-                resolve_segment(origin, place)
-                for origin, place in segment_specs
+        async def resolve_route_segments(
+            target_route: list[Place],
+        ) -> list[dict[str, Any]]:
+            specs: list[
+                tuple[tuple[float, float], Place]
+            ] = []
+            previous = (
+                req.latitude,
+                req.longitude,
             )
+
+            for target in target_route:
+                specs.append(
+                    (
+                        previous,
+                        target,
+                    )
+                )
+                previous = (
+                    target.latitude,
+                    target.longitude,
+                )
+
+            return await asyncio.gather(
+                *(
+                    resolve_segment(origin, target)
+                    for origin, target in specs
+                )
+            )
+
+        segment_results = await resolve_route_segments(
+            route
         )
+
+        # -----------------------------------------------------------
+        # 실제 Kakao 이동시간으로 행사 시간 앵커를 다시 검증합니다.
+        # 음식점/카페 삽입 이후 실제 이동시간이 예상보다 늘어날 수 있으므로
+        # 고정 행사 시작 15분 전 도착 조건을 충족할 때까지 행사 직전의
+        # 선택 장소를 하나씩 줄입니다. 꼭 포함 장소는 제거하지 않습니다.
+        # 더 이상 줄일 수 없으면 행사 자체를 빼고 일반 코스로 fallback합니다.
+        # -----------------------------------------------------------
+        for _ in range(4):
+            if not route or not segment_results:
+                break
+
+            trial_stays = _fit_itinerary_stays(
+                route,
+                available_minutes=req.available_minutes,
+                travel_minutes=sum(
+                    int(segment["travel_minutes"])
+                    for segment in segment_results
+                ),
+            )
+
+            trial_time = start
+            conflicting_event_index: int | None = None
+
+            for trial_index, (
+                trial_place,
+                trial_segment,
+                trial_stay,
+            ) in enumerate(
+                zip(
+                    route,
+                    segment_results,
+                    trial_stays,
+                )
+            ):
+                trial_time += timedelta(
+                    minutes=int(
+                        trial_segment["travel_minutes"]
+                    )
+                )
+
+                if str(
+                    trial_place.content_type_id
+                    or ""
+                ) == "15":
+                    event_start = _event_anchor_datetime(
+                        trial_place,
+                        start.date(),
+                    )
+                    event_end = _event_anchor_datetime(
+                        trial_place,
+                        start.date(),
+                        end=True,
+                    )
+
+                    if (
+                        trial_place.event_time_type == "fixed"
+                        and event_start is not None
+                    ):
+                        latest_arrival = (
+                            event_start
+                            - timedelta(minutes=15)
+                        )
+                        if trial_time > latest_arrival:
+                            conflicting_event_index = (
+                                trial_index
+                            )
+                            break
+                        if trial_time < event_start:
+                            trial_time = event_start
+
+                    elif (
+                        trial_place.event_time_type
+                        == "flexible"
+                    ):
+                        if (
+                            event_start is not None
+                            and trial_time < event_start
+                        ):
+                            trial_time = event_start
+
+                        if event_end is not None:
+                            minimum_visit = min(
+                                60,
+                                max(
+                                    30,
+                                    trial_stay,
+                                ),
+                            )
+                            if (
+                                trial_time
+                                + timedelta(
+                                    minutes=minimum_visit
+                                )
+                                > event_end
+                            ):
+                                conflicting_event_index = (
+                                    trial_index
+                                )
+                                break
+
+                trial_time += timedelta(
+                    minutes=trial_stay
+                )
+
+            if conflicting_event_index is None:
+                break
+
+            removable_index: int | None = None
+
+            for candidate_index in range(
+                conflicting_event_index - 1,
+                -1,
+                -1,
+            ):
+                candidate = route[
+                    candidate_index
+                ]
+                raw = (
+                    candidate.raw
+                    if isinstance(
+                        candidate.raw,
+                        dict,
+                    )
+                    else {}
+                )
+
+                if raw.get(
+                    "required_route_target"
+                ):
+                    continue
+
+                if str(
+                    candidate.content_type_id
+                    or ""
+                ) == "15":
+                    continue
+
+                removable_index = (
+                    candidate_index
+                )
+                break
+
+            if removable_index is None:
+                removed = route.pop(
+                    conflicting_event_index
+                )
+                print(
+                    "[EVENT ANCHOR FALLBACK]"
+                    f" event={removed.title!r}"
+                    " reason=actual_route_time_conflict"
+                )
+                chosen_event = None
+            else:
+                removed = route.pop(
+                    removable_index
+                )
+                print(
+                    "[EVENT ANCHOR ADJUST]"
+                    f" removed={removed.title!r}"
+                    " reason=protect_event_start"
+                )
+
+            segment_results = (
+                await resolve_route_segments(
+                    route
+                )
+            )
 
         print(
             "[ROUTE SEGMENTS]",
@@ -5236,6 +5914,60 @@ class RecommendationService:
                 minutes=travel_minutes
             )
 
+            if str(place.content_type_id or "") == "15":
+                event_start = _event_anchor_datetime(
+                    place,
+                    start.date(),
+                )
+                event_end = _event_anchor_datetime(
+                    place,
+                    start.date(),
+                    end=True,
+                )
+
+                # fixed 행사는 실제 시작시각보다 일찍 도착하면 기다렸다가 시작합니다.
+                if (
+                    place.event_time_type == "fixed"
+                    and event_start is not None
+                    and current_time < event_start
+                ):
+                    current_time = event_start
+
+                # flexible 운영시간도 시작 전이면 운영 시작까지 기다릴 수 있습니다.
+                elif (
+                    place.event_time_type == "flexible"
+                    and event_start is not None
+                    and current_time < event_start
+                ):
+                    current_time = event_start
+
+                if (
+                    event_end is not None
+                    and current_time >= event_end
+                ):
+                    # 이 경우는 사전 삽입 검증을 통과하기 어려우나,
+                    # 실제 길찾기 결과가 크게 늘어난 경우 경고를 남기기 위해
+                    # raw에 표시합니다. 가짜 시간으로 보정하지 않습니다.
+                    place.raw = dict(place.raw or {})
+                    place.raw["event_time_conflict"] = True
+
+            if str(place.content_type_id or "") == "15":
+                event_start = _event_anchor_datetime(place, start.date())
+                event_end = _event_anchor_datetime(place, start.date(), end=True)
+                if (
+                    place.event_time_type == "fixed"
+                    and event_start is not None
+                    and event_end is not None
+                    and event_end > event_start
+                ):
+                    place_stay = max(
+                        30,
+                        min(
+                            180,
+                            round((event_end - event_start).total_seconds() / 60),
+                        ),
+                    )
+
             result_places.append(
                 CoursePlace(
                     **place.model_dump(),
@@ -5265,10 +5997,12 @@ class RecommendationService:
             )
             total_distance_m += distance_m
 
-        total_minutes = sum(
-            place.travel_minutes_from_previous
-            + place.stay_minutes
-            for place in result_places
+        total_minutes = max(
+            0,
+            round(
+                (current_time - start).total_seconds()
+                / 60
+            ),
         )
 
         labels = {
@@ -5351,6 +6085,26 @@ class RecommendationService:
             warnings.append("요청한 맛집 후보를 현재 동선 주변에서 찾지 못했습니다.")
         if req.include_cafe and not has_cafe_stop:
             warnings.append("요청한 카페 후보를 현재 동선 주변에서 찾지 못했습니다.")
+
+        has_event_stop = any(
+            str(place.content_type_id or "") == "15"
+            for place in result_places
+        )
+
+        if event_requested and not has_event_stop:
+            warnings.append(
+                "선택한 날짜와 이동 조건에 맞는 행사를 넣기 어려워 다른 선호 테마 중심으로 구성했어요."
+            )
+
+        for event_place in result_places:
+            if (
+                str(event_place.content_type_id or "") == "15"
+                and isinstance(event_place.raw, dict)
+                and event_place.raw.get("event_time_conflict")
+            ):
+                warnings.append(
+                    f"{event_place.title}은 실제 이동시간에 따라 행사 종료 전 도착이 어려울 수 있어 확인이 필요합니다."
+                )
 
         for service_place in result_places:
             if (
@@ -7200,19 +7954,6 @@ class RagService:
         self.openai = OpenAIClient(settings)
         self.tour = TourApiClient(settings)
         self.official_tour = GyeongjuOfficialTourClient(settings)
-        self.heritage = KoreanHeritageClient(settings)
-        self.daum = DaumSearchClient(settings)
-        self.trusted_web = TrustedWebSourceClient(settings)
-
-    @staticmethod
-    def _timing_log(stage: str, **values: object) -> None:
-        parts = [f"RAG-TIMING stage={stage}"]
-        for key, value in values.items():
-            if isinstance(value, float):
-                parts.append(f"{key}={value:.3f}s")
-            else:
-                parts.append(f"{key}={value}")
-        print(" ".join(parts), flush=True)
 
     @classmethod
     def _place_aliases(cls, title: str) -> list[str]:
@@ -7463,433 +8204,12 @@ class RagService:
             bool(values),
         )
 
-    @staticmethod
-    def _answer_needs_external_fallback(answer: str) -> bool:
-        compact = re.sub(r"\s+", " ", answer or "").strip()
-        return any(
-            phrase in compact
-            for phrase in (
-                "확인할 수 있는 자료가 부족",
-                "자료가 부족",
-                "확인할 수 없습니다",
-                "정보를 확인할 수 없습니다",
-            )
-        )
-
-    @staticmethod
-    def _answer_is_grounded_unknown(answer: str) -> bool:
-        compact = re.sub(r"\s+", " ", answer or "").strip()
-        return any(
-            phrase in compact
-            for phrase in (
-                "알 수 없",
-                "미상",
-                "밝혀지지 않",
-                "확인되지 않",
-                "명시되어 있지 않",
-                "명시하지 않",
-                "확정되지 않",
-                "전해지지 않",
-            )
-        )
-
-    @classmethod
-    def _clean_external_answer(cls, answer: str) -> str:
-        cleaned = (answer or "").strip()
-        if cls._answer_is_grounded_unknown(cleaned):
-            cleaned = re.sub(
-                r"^\s*(?:확인할 수 있는 자료가 부족합니다|자료가 부족합니다)[.!]?\s*",
-                "",
-                cleaned,
-                count=1,
-            )
-        cleaned = re.sub(r"(?m)^\s*[-•]?\s*https?://\S+\s*$", "", cleaned)
-        cleaned = re.sub(r"https?://[^\s)\]]+", "", cleaned)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-        return cleaned
-
-    @staticmethod
-    def _external_hit(context: dict, index: int) -> RagHit:
-        source_url = str(context.get("source_url") or context.get("homepage") or "")
-        source_name = str(context.get("source_name") or "공식 자료")
-        return RagHit(
-            source_type="etiquette",
-            place_id=source_url or f"external-{index}",
-            title=str(context.get("title") or source_name),
-            category=str(context.get("category") or "공식 웹자료"),
-            similarity=1.0,
-            overview=context.get("overview"),
-            homepage=source_url or None,
-        )
-
-    @staticmethod
-    def _clean_search_title(value: object) -> str:
-        text = re.sub(r"<[^>]+>", " ", str(value or ""))
-        return re.sub(r"\s+", " ", text).strip()
-
-    @staticmethod
-    def _external_subject_variants(subject: str, query: str) -> list[str]:
-        """외부 공식자료 검색용 장소명 변형을 만듭니다.
-
-        TourAPI 장소명에는 ``천마총(대릉원)``처럼 상위 관광지명이 괄호로 붙는
-        경우가 있어 국가유산/박물관 검색에서 그대로 쓰면 검색률이 크게 떨어집니다.
-        검색용으로만 괄호를 제거하고, 질문에서 드러난 핵심 명칭도 보조 후보로 사용합니다.
-        """
-
-        def clean(value: str) -> str:
-            value = re.sub(r"\s+", " ", value or "").strip()
-            value = re.sub(r"^경주\s+", "", value).strip()
-            return value.strip(" -·/|,")
-
-        variants: list[str] = []
-
-        def add(value: str) -> None:
-            value = clean(value)
-            if len(value) >= 2 and value not in variants:
-                variants.append(value)
-
-        add(subject)
-        add(re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}", " ", subject))
-
-        # 괄호 안 명칭도 별도 후보로 둡니다. 예: 천마총(대릉원) -> 대릉원
-        for inner in re.findall(r"\(([^)]+)\)|\[([^]]+)\]|\{([^}]+)\}", subject):
-            add(next((part for part in inner if part), ""))
-
-        # 질문의 앞부분에서 장소/유산명으로 보이는 구절을 추출합니다.
-        # 예: "천마총은 누구 무덤이야?" -> "천마총"
-        question_match = re.match(
-            r"^\s*(.+?)(?:은|는|이|가|을|를|의|에서|에는|에)?\s*(?:누구|언제|왜|어디|무엇|뭐|어떤|몇|어떻게)",
-            query or "",
-        )
-        if question_match:
-            add(question_match.group(1))
-
-        # 토큰 단위 후보는 너무 일반적인 말은 제외합니다.
-        stop = {
-            "누구", "언제", "어디", "무엇", "뭐야", "어떤", "왜", "어떻게",
-            "무덤", "정보", "설명", "알려줘", "알려", "경주",
-        }
-        for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query or ""):
-            token = re.sub(r"(?:은|는|이|가|을|를|의|에서|에는|에)$", "", token)
-            if token not in stop and len(token) >= 2:
-                subject_key = normalize_name(clean(subject))
-                token_key = normalize_name(token)
-                if not subject_key or token_key in subject_key or subject_key in token_key:
-                    add(token)
-
-        return variants[:6]
-
-    @staticmethod
-    def _trusted_search_snippet_context(document: dict, source_name: str) -> dict | None:
-        """원문 fetch가 막힐 때 신뢰 도메인의 Daum 검색 요약을 최후 fallback으로 사용합니다.
-
-        일반 웹문서의 검색 요약은 사용하지 않습니다. URL이 신뢰 도메인으로 검증된
-        결과만 허용하고, 화면에도 원문 URL을 함께 노출합니다.
-        """
-        title = RagService._clean_search_title(document.get("title"))
-        contents = re.sub(r"<[^>]+>", " ", str(document.get("contents") or ""))
-        contents = re.sub(r"\s+", " ", contents).strip()
-        url = str(document.get("url") or "").strip()
-        if not title or len(contents) < 30 or not url:
-            return None
-        return {
-            "title": f"{source_name} - {title}",
-            "category": "공식 웹검색 요약",
-            "overview": contents[:3000],
-            "homepage": url,
-            "source_url": url,
-            "source_name": source_name,
-        }
-
-    async def _external_official_contexts(
-        self,
-        query: str,
-        exact_place: PlaceRecord | None,
-    ) -> list[dict]:
-        """내부 RAG가 부족할 때 공식 외부자료를 단계적으로 수집합니다.
-
-        순서:
-        1) 국가유산청 공개 Open API
-        2) Daum 웹문서 검색으로 공식 원문 URL 탐색
-        3) 신뢰 도메인 원문 직접 fetch
-        4) 원문 fetch가 막힌 경우에만 신뢰 도메인의 Daum 검색 요약 사용
-
-        ``천마총(대릉원)``처럼 TourAPI의 복합 장소명이 들어와도 검색용 별칭으로
-        ``천마총``을 함께 사용합니다.
-        """
-        external_started = time.perf_counter()
-        subject = exact_place.title if exact_place is not None else query
-        variants = self._external_subject_variants(subject, query)
-        if not variants:
-            self._timing_log(
-                "external_sources",
-                total=time.perf_counter() - external_started,
-                heritage=0.0,
-                daum=0.0,
-                fetch=0.0,
-                contexts=0,
-            )
-            return []
-
-        contexts: list[dict] = []
-        seen_urls: set[str] = set()
-
-        heritage_started = time.perf_counter()
-
-        # 1) 국가유산청. 괄호가 붙은 TourAPI 명칭 그대로 한 번만 조회하지 않고
-        #    정제한 장소명 변형을 순차 조회합니다.
-        for variant in variants[:3]:
-            try:
-                heritage_contexts = await asyncio.wait_for(
-                    self.heritage.contexts(variant, limit=2),
-                    timeout=6.0,
-                )
-            except (IntegrationError, asyncio.TimeoutError, ValueError):
-                heritage_contexts = []
-
-            for context in heritage_contexts:
-                url = str(context.get("source_url") or "")
-                if url and url in seen_urls:
-                    continue
-                if url:
-                    seen_urls.add(url)
-                contexts.append(context)
-                if len(contexts) >= 3:
-                    break
-            if len(contexts) >= 3:
-                break
-
-        heritage_seconds = time.perf_counter() - heritage_started
-        daum_started = time.perf_counter()
-
-        # 2) Daum 웹검색. 카카오 문서에 보장되지 않은 site: 연산자에 의존하지 않고
-        #    기관명을 검색어에 직접 넣습니다. 첫 검색은 질문 자체를 살려 의도(피장자 등)를
-        #    보존하고, 이후 검색은 국립경주박물관/국가유산청 등 공식기관명으로 보강합니다.
-        search_queries: list[str] = []
-
-        def add_query(value: str) -> None:
-            value = re.sub(r"\s+", " ", value).strip()
-            if value and value not in search_queries:
-                search_queries.append(value)
-
-        for variant in variants[:3]:
-            if normalize_name(variant) in normalize_name(query):
-                add_query(query)
-            else:
-                add_query(f"{variant} {query}")
-            add_query(f"{variant} 국립경주박물관")
-            add_query(f"{variant} 국가유산청")
-            add_query(f"{variant} 국가유산포털")
-            add_query(f"{variant} 국립중앙박물관")
-
-        # 역사 질문에 자주 쓰이는 핵심 표현도 검색어에 보강합니다.
-        if any(token in query for token in ("누구", "무덤", "피장자", "주인")):
-            add_query(f"{variants[0]} 피장자 무덤 주인")
-        if any(token in query for token in ("언제", "시대", "만들", "조성")):
-            add_query(f"{variants[0]} 조성 시기 시대")
-
-        documents: list[dict] = []
-        seen_search_urls: set[str] = set()
-        subject_keys = [normalize_name(value) for value in variants if normalize_name(value)]
-        query_tokens = [
-            token
-            for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query)
-            if token not in {"알려줘", "알려", "누구", "뭐야", "어디", "경주"}
-        ]
-
-        for search_query in search_queries[:12]:
-            try:
-                found = await asyncio.wait_for(
-                    self.daum.web_documents(search_query, limit=30),
-                    timeout=5.0,
-                )
-            except (IntegrationError, asyncio.TimeoutError, ValueError):
-                continue
-            for document in found:
-                url = str(document.get("url") or "").strip()
-                if not url or url in seen_search_urls:
-                    continue
-                source_name = self.trusted_web.trusted_source_name(url)
-                if not source_name:
-                    continue
-                seen_search_urls.add(url)
-                searchable = normalize_name(
-                    f"{document.get('title', '')} {document.get('contents', '')}"
-                )
-                score = 0
-                if any(key and key in searchable for key in subject_keys):
-                    score += 120
-                score += sum(6 for token in query_tokens if normalize_name(token) in searchable)
-                source_bonus = {
-                    "국립경주박물관": 55,
-                    "국가유산청": 50,
-                    "국가유산포털": 48,
-                    "국립문화유산연구원": 45,
-                    "국립중앙박물관": 42,
-                    "경주시": 30,
-                    "대한민국 구석구석": 20,
-                }.get(source_name, 0)
-                documents.append({
-                    **document,
-                    "source_name": source_name,
-                    "_score": score + source_bonus,
-                })
-
-        daum_seconds = time.perf_counter() - daum_started
-        fetch_started = time.perf_counter()
-
-        documents.sort(key=lambda item: int(item.get("_score") or 0), reverse=True)
-        fetch_candidates = [
-            doc for doc in documents
-            if str(doc.get("url") or "") not in seen_urls
-        ][:10]
-
-        async def _fetch(document: dict):
-            url = str(document.get("url") or "")
-            try:
-                result = await asyncio.wait_for(
-                    self.trusted_web.fetch_document(
-                        url,
-                        query=query,
-                        title=variants[0],
-                    ),
-                    timeout=6.0,
-                )
-            except (IntegrationError, asyncio.TimeoutError, ValueError):
-                return None
-            if result:
-                page_title = self._clean_search_title(document.get("title"))
-                if page_title:
-                    result["title"] = f"{result.get('source_name', '공식 자료')} - {page_title}"
-            return result
-
-        fetched = (
-            await asyncio.gather(
-                *(_fetch(document) for document in fetch_candidates),
-                return_exceptions=False,
-            )
-            if fetch_candidates
-            else []
-        )
-
-        for context in fetched:
-            if not context:
-                continue
-            url = str(context.get("source_url") or "")
-            if url and url in seen_urls:
-                continue
-            if url:
-                seen_urls.add(url)
-            contexts.append(context)
-            if len(contexts) >= 5:
-                fetch_seconds = time.perf_counter() - fetch_started
-                self._timing_log(
-                    "external_sources",
-                    total=time.perf_counter() - external_started,
-                    heritage=heritage_seconds,
-                    daum=daum_seconds,
-                    fetch=fetch_seconds,
-                    heritage_contexts=sum(
-                        1
-                        for item in contexts
-                        if str(item.get("source_name") or "").startswith("국가유산")
-                    ),
-                    daum_docs=len(documents),
-                    fetch_candidates=len(fetch_candidates),
-                    contexts=len(contexts[:5]),
-                )
-                return contexts[:5]
-
-        # 4) 일부 공공기관은 Railway에서 원문 fetch가 막히거나 첨부/뷰어 URL을
-        #    반환하기도 합니다. 이때 답을 포기하지 않고, 신뢰 도메인으로 검증된 Daum
-        #    웹검색 결과의 본문 요약만 최후 fallback으로 사용합니다.
-        for document in documents:
-            url = str(document.get("url") or "")
-            if not url or url in seen_urls:
-                continue
-            source_name = str(document.get("source_name") or "")
-            if not source_name:
-                continue
-            context = self._trusted_search_snippet_context(document, source_name)
-            if not context:
-                continue
-            searchable = normalize_name(
-                f"{context.get('title', '')} {context.get('overview', '')}"
-            )
-            if subject_keys and not any(key in searchable for key in subject_keys):
-                continue
-            seen_urls.add(url)
-            contexts.append(context)
-            if len(contexts) >= 5:
-                break
-
-        fetch_seconds = time.perf_counter() - fetch_started
-        self._timing_log(
-            "external_sources",
-            total=time.perf_counter() - external_started,
-            heritage=heritage_seconds,
-            daum=daum_seconds,
-            fetch=fetch_seconds,
-            heritage_contexts=sum(
-                1
-                for item in contexts
-                if str(item.get("source_name") or "").startswith("국가유산")
-            ),
-            daum_docs=len(documents),
-            fetch_candidates=len(fetch_candidates),
-            contexts=len(contexts[:5]),
-        )
-        return contexts[:5]
-
-    async def _external_fallback_response(
-        self,
-        query: str,
-        history: list[ChatTurn],
-        exact_place: PlaceRecord | None,
-    ) -> RagSearchResponse | None:
-        fallback_started = time.perf_counter()
-        contexts = await self._external_official_contexts(query, exact_place)
-        collect_seconds = time.perf_counter() - fallback_started
-        if not contexts:
-            self._timing_log(
-                "external_fallback",
-                total=time.perf_counter() - fallback_started,
-                collect=collect_seconds,
-                openai=0.0,
-                contexts=0,
-            )
-            return None
-
-        # 화면과 모델에 너무 많은 출처를 넘기지 않습니다. 공식성/관련도 순으로 이미 정렬된
-        # 상위 3개만 사용하면 답변 집중도와 모바일 UI 가독성이 좋아집니다.
-        contexts = contexts[:3]
-        openai_started = time.perf_counter()
-        answer = await self.openai.answer_with_context(query, contexts, history=history)
-        openai_seconds = time.perf_counter() - openai_started
-        answer = self._clean_external_answer(answer)
-        grounded_unknown = self._answer_is_grounded_unknown(answer)
-        grounded = grounded_unknown or not self._answer_needs_external_fallback(answer)
-        self._timing_log(
-            "external_fallback",
-            total=time.perf_counter() - fallback_started,
-            collect=collect_seconds,
-            openai=openai_seconds,
-            contexts=len(contexts),
-        )
-        return RagSearchResponse(
-            query=query,
-            answer=answer,
-            hits=[self._external_hit(context, index) for index, context in enumerate(contexts)],
-            grounded=grounded,
-        )
-
     async def search(
         self,
         query: str,
         top_k: int,
         history: list[ChatTurn] | None = None,
     ) -> RagSearchResponse:
-        total_started = time.perf_counter()
         history = history or []
 
         # 의미검색에는 직전 사용자 발화를 보강해 지시어("그거", "거기") 문맥을 살립니다.
@@ -7906,15 +8226,8 @@ class RagService:
         structured_fields = self._structured_fields(query)
 
         if exact_place is not None and structured_fields:
-            structured_started = time.perf_counter()
             exact_place = await self._refresh_place_record(exact_place, structured_fields)
             answer, grounded = self._structured_answer(exact_place, structured_fields)
-            self._timing_log(
-                "search_total",
-                total=time.perf_counter() - total_started,
-                route="structured",
-                structured=time.perf_counter() - structured_started,
-            )
             return RagSearchResponse(
                 query=query,
                 answer=answer,
@@ -7922,10 +8235,7 @@ class RagService:
                 grounded=grounded,
             )
 
-        embedding_started = time.perf_counter()
         vector = (await self.openai.embeddings([search_text]))[0]
-        embedding_seconds = time.perf_counter() - embedding_started
-        retrieval_started = time.perf_counter()
 
         place_records = [record for record in all_place_records if record.embedding]
         doc_records = list(
@@ -7982,28 +8292,8 @@ class RagService:
             key=lambda item: item[0],
             reverse=True,
         )
-        retrieval_seconds = time.perf_counter() - retrieval_started
 
         if not selected or selected[0][0] < self.settings.rag_min_similarity:
-            external = await self._external_fallback_response(
-                query, history, exact_place
-            )
-            if external is not None:
-                self._timing_log(
-                    "search_total",
-                    total=time.perf_counter() - total_started,
-                    route="external_no_internal_hit",
-                    embedding=embedding_seconds,
-                    retrieval=retrieval_seconds,
-                )
-                return external
-            self._timing_log(
-                "search_total",
-                total=time.perf_counter() - total_started,
-                route="ungrounded_no_hit",
-                embedding=embedding_seconds,
-                retrieval=retrieval_seconds,
-            )
             return RagSearchResponse(
                 query=query,
                 answer=(
@@ -8046,38 +8336,12 @@ class RagService:
                     )
                 )
 
-        internal_openai_started = time.perf_counter()
         answer = await self.openai.answer_with_context(query, contexts, history=history)
-        internal_openai_seconds = time.perf_counter() - internal_openai_started
 
-        if self._answer_needs_external_fallback(answer):
-            external = await self._external_fallback_response(
-                query, history, exact_place
-            )
-            if external is not None:
-                self._timing_log(
-                    "search_total",
-                    total=time.perf_counter() - total_started,
-                    route="external_after_internal",
-                    embedding=embedding_seconds,
-                    retrieval=retrieval_seconds,
-                    internal_openai=internal_openai_seconds,
-                )
-                return external
-
-        self._timing_log(
-            "search_total",
-            total=time.perf_counter() - total_started,
-            route="internal",
-            embedding=embedding_seconds,
-            retrieval=retrieval_seconds,
-            internal_openai=internal_openai_seconds,
-        )
         return RagSearchResponse(
             query=query,
             answer=answer,
             hits=hits,
-            grounded=not self._answer_needs_external_fallback(answer),
         )
 
 def _cosine(

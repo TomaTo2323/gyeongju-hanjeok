@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import asyncio
 import random
@@ -215,6 +215,9 @@ class FrontRecommendRequest(BaseModel):
     def start_longitude(self) -> float:
         return DEFAULT_LONGITUDE
     transport_type: str = "car"
+    # 여행 날짜/시각은 행사 기간·운영시간 검증용이며 사용자 위치와 무관합니다.
+    travel_date: str = ""  # YYYY-MM-DD
+    start_time: str = ""   # HH:mm
     radius_km: float = Field(default=15, gt=0, le=30)
     preferred_categories: list[str] = Field(default_factory=list)
     avoid_paid: bool = False
@@ -593,6 +596,45 @@ async def _apply_gpt_route_request(
     return updated
 
 
+def _front_trip_start(
+    body: FrontRecommendRequest,
+) -> datetime:
+    kst = timezone(timedelta(hours=9))
+    now = datetime.now(kst)
+
+    try:
+        travel_day = datetime.strptime(
+            body.travel_date.strip(),
+            "%Y-%m-%d",
+        ).date()
+    except (ValueError, AttributeError):
+        travel_day = now.date()
+
+    try:
+        hour_text, minute_text = body.start_time.strip().split(
+            ":",
+            1,
+        )
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        # 날짜만 지정되고 시각이 없으면 현재시각을 공식 정보처럼 만들지 않고
+        # 요청 시작시각으로만 사용합니다.
+        hour = now.hour
+        minute = now.minute
+
+    return datetime(
+        travel_day.year,
+        travel_day.month,
+        travel_day.day,
+        hour,
+        minute,
+        tzinfo=kst,
+    )
+
+
 def _to_backend_request(
     body: FrontRecommendRequest,
     *,
@@ -635,6 +677,7 @@ def _to_backend_request(
     )
 
     return RecommendRequest(
+        start_time=_front_trip_start(body),
         available_minutes=max(
             60,
             round(
@@ -704,6 +747,9 @@ def _front_place_category(
     title = (
         place.title or ""
     ).lower()
+
+    if str(place.content_type_id or "") == "15":
+        return "행사"
 
     if (
         service_kind == "cafe"
@@ -1608,6 +1654,13 @@ def _place_to_front(place: Place) -> dict[str, Any]:
         "rest_date": place.rest_date,
         "fee_text": place.fee_text,
         "parking": place.parking,
+        "event_start_date": place.event_start_date,
+        "event_end_date": place.event_end_date,
+        "event_start_time": place.event_start_time,
+        "event_end_time": place.event_end_time,
+        "event_place": place.event_place,
+        "event_time_type": place.event_time_type or "unknown",
+        "source": place.source,
         "phone": place.tel or "",
         "tel": place.tel or "",
         "homepage": place.homepage or "",

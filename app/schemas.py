@@ -51,6 +51,16 @@ class Place(BaseModel):
     is_free: bool | None = None
     parking: str | None = None
 
+    # 축제/공연/행사(contentTypeId=15) 메타데이터
+    # 날짜/시간이 실제 TourAPI 응답에 있을 때만 채우며 임의 시간을 만들지 않습니다.
+    event_start_date: str | None = None
+    event_end_date: str | None = None
+    event_start_time: str | None = None
+    event_end_time: str | None = None
+    event_place: str | None = None
+    event_time_type: str | None = None  # fixed | flexible | unknown
+    source: str | None = None
+
     # 각 상세정보의 실제 출처
     overview_source: str | None = None
     fee_source: str | None = None
