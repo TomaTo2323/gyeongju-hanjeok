@@ -1105,6 +1105,17 @@ class GyeongjuOfficialTourClient(BaseClient):
     # 핵심 관광지는 "공식 페이지에 값이 분명히 있는 경우"에 한해 안전하게 답합니다.
     # 이 값들은 일반 웹/블로그가 아니라 아래 source_url의 경주시 공식 페이지 기준입니다.
     VERIFIED_OFFICIAL_FACTS: dict[str, dict[str, str]] = {
+        "신라왕경숲": {
+            "source_url": "https://www.gyeongju.go.kr/tour/page.do?mnu_uid=4753",
+            "overview": (
+                "신라왕경숲은 신라 시대 왕경지구의 하천 범람을 막기 위해 "
+                "조성했던 오리수를 재현한 숲으로, 산책과 피크닉을 즐기기 좋은 공간입니다."
+            ),
+            "operating_hours": "이용시간 제한 없음",
+            "rest_date": "연중무휴",
+            "parking": "무료 주차장 이용",
+            "address": "경주시 구황동 885-6",
+        },
         "첨성대": {
             "source_url": (
                 "https://www.gyeongju.go.kr/tour/"
@@ -1132,10 +1143,10 @@ class GyeongjuOfficialTourClient(BaseClient):
             "관람료", "입장료", "이용료", "요금",
         ),
         "parking": (
-            "주차정보", "주차 안내", "주차안내", "주차",
+            "주차정보", "주차 안내", "주차안내", "주차시설",
         ),
         "tel": (
-            "전화", "문의전화", "문의처", "문의",
+            "전화번호", "문의 및 안내", "문의전화", "문의처", "전화",
         ),
         "address": (
             "주소", "위치",
@@ -1221,23 +1232,46 @@ class GyeongjuOfficialTourClient(BaseClient):
         lines: list[str],
         labels: tuple[str, ...],
     ) -> str | None:
+        # 관광 소개 본문 속 단어(예: "주차장에서", "문의가")를
+        # 구조화 필드 라벨로 오인하지 않도록 라인 시작 일치만 허용합니다.
+        known_labels = {
+            label
+            for values in cls.FIELD_LABELS.values()
+            for label in values
+        }
+
         for index, line in enumerate(lines):
-            for label in labels:
-                pos = line.find(label)
-                if pos < 0:
+            normalized_line = re.sub(r"^info\.\s*", "", line, flags=re.IGNORECASE).strip()
+
+            for label in sorted(labels, key=len, reverse=True):
+                if not normalized_line.startswith(label):
                     continue
 
-                value = line[pos + len(label):].strip(" \t:：-·|")
-                if not value and index + 1 < len(lines):
-                    value = lines[index + 1].strip()
+                tail = normalized_line[len(label):]
+                # "주차장..."처럼 라벨 뒤에 바로 다른 한글이 붙은 본문은 제외합니다.
+                if tail and tail[0] not in " \t:：-·|/":
+                    continue
 
-                # 메뉴/내비게이션에 잡힌 한 단어 라벨은 값으로 쓰지 않습니다.
+                value = tail.strip(" \t:：-·|/")
+
+                if not value and index + 1 < len(lines):
+                    next_line = re.sub(r"^info\.\s*", "", lines[index + 1], flags=re.IGNORECASE).strip()
+                    if any(next_line.startswith(item) for item in known_labels):
+                        continue
+                    value = next_line
+
+                value = re.sub(r"\s+", " ", value).strip(" \t:：-·|/")
                 if not value or value == label:
                     continue
 
-                value = re.sub(r"\s+", " ", value).strip()
-                if 1 <= len(value) <= 500:
-                    return value
+                # 구조화 방문정보에 긴 관광 소개 문단이 들어오는 것을 차단합니다.
+                if len(value) > 180:
+                    continue
+                if value.count(".") >= 2 or value.count("다.") >= 2:
+                    continue
+
+                return value
+
         return None
 
     @classmethod

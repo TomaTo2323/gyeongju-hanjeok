@@ -1463,29 +1463,14 @@ async def _quick_overview_from_naver(
     ]
 
     if repeated:
-        category = _front_place_category(place)
-        features = "·".join(repeated[:2])
-
+        # 블로그 특징을 조합한 문장을 장소 소개로 생성하지 않습니다.
+        # 공식/TourAPI 실제 소개가 없으면 소개 정보 없음 상태를 유지합니다.
         print(
             "[PLACE OVERVIEW SEARCH]",
             f"title={place.title!r}",
-            "source=naver_blog_consensus",
+            "source=blog_consensus_ignored",
         )
-
-        if category in {"맛집", "카페"}:
-            return (
-                f"{place.title}. {features} 관련 방문 후기가 "
-                f"반복적으로 확인되는 {category}입니다.",
-                "naver_blog_consensus",
-                None,
-            )
-
-        return (
-            f"{place.title}. {features} 관련 방문 후기가 "
-            "반복적으로 확인되는 관광지입니다.",
-            "naver_blog_consensus",
-            None,
-        )
+        return None, None, None
 
     print(
         "[PLACE OVERVIEW SEARCH]",
@@ -2850,40 +2835,32 @@ def _place_detail_facts_from_official_text(
     title: str,
     raw_text: str,
 ) -> dict[str, str]:
-    """경주시/대한민국 구석구석 원문에서 방문정보만 보수적으로 추출합니다.
-
-    명시되지 않은 값은 만들지 않습니다.
-    """
+    """공식 원문에서 명시적으로 라벨된 방문정보만 보수적으로 추출합니다."""
     text = html.unescape(raw_text or "").replace("\xa0", " ")
     text = re.sub(r"\r\n?", "\n", text)
     lines = [
-        re.sub(r"\s+", " ", line).strip(" \t:-·|")
+        re.sub(r"\s+", " ", line).strip(" \t:-·|/")
         for line in text.splitlines()
     ]
     lines = [line for line in lines if line]
-    clean = " \n ".join(lines)
-
     result: dict[str, str] = {}
 
-    next_labels = (
-        "주소|위치|이용시간|운영시간|관람시간|개방시간|영업시간|"
-        "휴무일|휴관일|쉬는날|쉬는 날|이용료|입장료|관람료|요금|"
-        "주차정보|주차 안내|주차안내|주차|편의시설|전화|문의전화|문의처|문의"
-    )
-
-    def extract(*labels: str, max_len: int = 260) -> str | None:
-        joined = "|".join(re.escape(label) for label in labels)
-        match = re.search(
-            rf"(?:{joined})\s*[:：]?\s*(.+?)(?=\s*(?:-|·|\|)?\s*(?:{next_labels})\s*[:：]|\n|$)",
-            clean,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            return None
-        value = re.sub(r"\s+", " ", match.group(1)).strip(" -·|,;")
-        if not value:
-            return None
-        return value[:max_len]
+    def extract(*labels: str, max_len: int = 180) -> str | None:
+        for line in lines:
+            normalized = re.sub(r"^info\.\s*", "", line, flags=re.IGNORECASE).strip()
+            for label in sorted(labels, key=len, reverse=True):
+                if not normalized.startswith(label):
+                    continue
+                tail = normalized[len(label):]
+                if tail and tail[0] not in " \t:：-·|/":
+                    continue
+                value = re.sub(r"\s+", " ", tail.strip(" \t:：-·|/")).strip()
+                if not value or len(value) > max_len:
+                    continue
+                if value.count(".") >= 2 or value.count("다.") >= 2:
+                    continue
+                return value
+        return None
 
     hours = extract("이용시간", "운영시간", "관람시간", "개방시간", "영업시간")
     if hours:
@@ -2892,50 +2869,47 @@ def _place_detail_facts_from_official_text(
     rest = extract("휴무일", "휴관일", "쉬는날", "쉬는 날")
     if rest:
         result["rest_date"] = rest
-    elif "연중무휴" in clean:
-        result["rest_date"] = "연중무휴"
 
     fee = extract("이용료", "입장료", "관람료", "요금")
     if fee:
         result["fee_text"] = fee
-    elif re.search(r"(?:무료이용|무료 이용|이용료\s*[:：]?\s*무료|입장료\s*[:：]?\s*무료)", clean):
-        result["fee_text"] = "무료"
 
-    parking = extract("주차정보", "주차 안내", "주차안내", "주차")
+    parking = extract("주차정보", "주차 안내", "주차안내", "주차시설")
     if not parking:
         facilities = extract("편의시설")
         if facilities and "주차" in facilities:
-            parking = facilities
+            # 편의시설 전체 문장을 주차 칸에 넣지 않고 주차 관련 사실만 최소화합니다.
+            if "무료 주차장" in facilities:
+                parking = "무료 주차장 이용"
+            elif "주차장" in facilities:
+                parking = "주차장 이용 가능"
     if parking:
         result["parking"] = parking
-    elif "무료 주차장" in clean:
-        result["parking"] = "무료 주차장 이용"
-    elif "주차장" in clean:
-        # 원문에 주차장이 있다는 사실만 분명할 때 최소 표현만 사용합니다.
-        result["parking"] = "주차장 이용 가능"
 
-    tel_area = extract("전화", "문의전화", "문의처", "문의") or clean
-    phone_match = re.search(r"(?:0\d{1,2})[-\s)]?\d{3,4}[-\s]?\d{4}", tel_area)
-    if phone_match:
-        result["tel"] = re.sub(r"\s+", "-", phone_match.group(0))
+    tel_area = extract("전화번호", "문의 및 안내", "문의전화", "문의처", "전화")
+    if tel_area:
+        phone_match = re.search(r"(?:0\d{1,2})[-\s)]?\d{3,4}[-\s]?\d{4}", tel_area)
+        if phone_match:
+            result["tel"] = re.sub(r"\s+", "-", phone_match.group(0))
 
     normalized_title = normalize_name(title)
     description_parts: list[str] = []
     for line in lines:
         compact = normalize_name(line)
-        if len(line) < 30 or len(line) > 700:
+        if len(line) < 35 or len(line) > 500:
             continue
         if normalized_title and normalized_title not in compact:
             continue
-        # 라벨 나열 문구는 장소소개에서 제외합니다.
-        if sum(label in line for label in ("주소", "이용시간", "운영시간", "이용료", "주차정보", "편의시설")) >= 2:
+        if any(line.startswith(label) for label in (
+            "주소", "위치", "이용시간", "운영시간", "관람시간", "휴무일",
+            "이용료", "입장료", "주차정보", "주차시설", "편의시설", "전화",
+        )):
             continue
         description_parts.append(line)
-        if len(" ".join(description_parts)) >= 260:
-            break
+        break
 
     if description_parts:
-        result["overview"] = " ".join(description_parts)[:600]
+        result["overview"] = description_parts[0][:600]
 
     return result
 
@@ -2957,6 +2931,8 @@ async def _enrich_place_detail_from_official_sources(
 
     # 1) 이미 RAG에서 검증해 쓰는 경주시 공식 관광정보 클라이언트를 재사용합니다.
     requested_fields: set[str] = set()
+    if not result.overview:
+        requested_fields.add("overview")
     if not result.operating_hours:
         requested_fields.add("operating_hours")
     if not result.rest_date:
@@ -2980,6 +2956,9 @@ async def _enrich_place_detail_from_official_sources(
 
         if official:
             official_url = str(official.get("source_url") or "").strip() or None
+            if not result.overview and official.get("overview"):
+                result.overview = str(official["overview"])
+                result.overview_source = "official_web"
             if not result.operating_hours and official.get("operating_hours"):
                 result.operating_hours = str(official["operating_hours"])
                 result.operating_hours_source = "official_web"
