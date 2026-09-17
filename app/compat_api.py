@@ -1226,6 +1226,126 @@ def _grounded_fallback_overview(
     )
 
 
+
+def _is_strict_place_overview_web_result(
+    place: Place,
+    *,
+    title: str,
+    description: str,
+    url: str,
+) -> bool:
+    """
+    '장소 소개'로 쓸 수 있는 공식 웹 검색 결과인지 엄격하게 확인합니다.
+
+    핵심 원칙:
+    - 본문 어딘가에 장소명이 우연히 등장하는 글은 사용하지 않음
+    - 검색결과 제목 자체가 해당 장소명과 직접 일치/포함 관계여야 함
+    - 경주시 공식 사이트는 관광 페이지(/tour/)만 허용
+    - 뉴스/보도자료/공지/행사 안내처럼 장소 자체 소개가 아닌 문서는 제외
+    - 소개가 애매하면 틀린 설명을 만들지 않고 빈 값으로 둠
+    """
+    clean_title = re.sub(
+        r"\s+",
+        " ",
+        title or "",
+    ).strip()
+
+    clean_description = re.sub(
+        r"\s+",
+        " ",
+        description or "",
+    ).strip()
+
+    if (
+        len(clean_description) < 20
+        or _looks_like_location_description(
+            clean_description
+        )
+    ):
+        return False
+
+    normalized_result_title = normalize_name(
+        clean_title
+    )
+
+    aliases = _overview_place_aliases(
+        place.title
+    )
+
+    # 장소명이 '설명 본문'에만 우연히 등장하는 문서는 거부합니다.
+    # 검색결과 제목 자체가 그 장소의 상세 페이지임을 보여줘야 합니다.
+    title_matches_place = any(
+        alias
+        and (
+            alias == normalized_result_title
+            or alias in normalized_result_title
+        )
+        for alias in aliases
+    )
+
+    if not title_matches_place:
+        return False
+
+    lowered_title = clean_title.lower()
+
+    non_overview_title_tokens = (
+        "보도자료",
+        "공지사항",
+        "공지",
+        "새소식",
+        "뉴스",
+        "언론",
+        "채용",
+        "입찰",
+        "고시",
+        "공고",
+        "행사안내",
+        "행사 안내",
+        "축제소식",
+        "축제 소식",
+        "의회",
+    )
+
+    if any(
+        token in lowered_title
+        for token in non_overview_title_tokens
+    ):
+        return False
+
+    try:
+        parsed = urlparse(
+            url
+        )
+        host = (
+            parsed.hostname
+            or ""
+        ).lower()
+        path = (
+            parsed.path
+            or ""
+        ).lower()
+    except ValueError:
+        return False
+
+    # gyeongju.go.kr 전체를 신뢰하면 시정뉴스/보도자료의 한 문장이
+    # 장소 설명으로 잡힐 수 있습니다. 관광 섹션만 허용합니다.
+    if (
+        host == "gyeongju.go.kr"
+        or host.endswith(
+            ".gyeongju.go.kr"
+        )
+    ):
+        if not (
+            path.startswith(
+                "/tour/"
+            )
+            or "/tour/" in path
+        ):
+            return False
+
+    return True
+
+
 async def _quick_overview_from_naver(
     place: Place,
     settings: Settings,
@@ -1420,12 +1540,12 @@ async def _quick_overview_from_naver(
             str(row.get("description") or ""),
         ).strip()
 
-        combined = f"{title} {description}".strip()
-        if not _overview_mentions_place(place.title, combined):
-            continue
-        if len(description) < 20:
-            continue
-        if _looks_like_location_description(description):
+        if not _is_strict_place_overview_web_result(
+            place,
+            title=title,
+            description=description,
+            url=url,
+        ):
             continue
 
         normalized_title = normalize_name(title)
@@ -1463,6 +1583,7 @@ async def _quick_overview_from_naver(
             f"title={place.title!r}",
             f"source={search_source}",
             f"official={source_label}",
+            "match=strict_place_page",
             f"naver_web={len(naver_web_rows)}",
             f"kakao_web={len(kakao_web_rows)}",
         )
