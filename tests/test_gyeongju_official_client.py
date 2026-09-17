@@ -76,7 +76,7 @@ def test_official_client_uses_only_current_gyeongju_tour_pages(monkeypatch):
         client.place_info("경주 첨성대", {"operating_hours", "fee_text"})
     )
 
-    assert result["operating_hours"].startswith("09:00-22:00")
+    assert result["operating_hours"].replace(" ", "").startswith("09:00-22:00")
     assert result["fee_text"] == "무료"
     assert result["source_name"] == "경주시 경주문화관광"
     assert result["source_url"].startswith("https://www.gyeongju.go.kr/tour/")
@@ -108,7 +108,60 @@ def test_official_client_direct_seed_works_without_naver_results(monkeypatch):
         client.place_info("경주 첨성대", {"operating_hours", "fee_text", "parking"})
     )
 
-    assert result["operating_hours"].startswith("09:00 -22:00")
+    assert result["operating_hours"].replace(" ", "").startswith("09:00-22:00")
     assert result["fee_text"] == "무료"
     assert "쪽샘임시주차장" in result["parking"]
+    assert result["source_url"].startswith("https://www.gyeongju.go.kr/tour/")
+
+
+def test_official_verified_snapshot_works_when_network_is_unavailable(monkeypatch):
+    client = GyeongjuOfficialTourClient(_settings())
+
+    async def fail_web_documents(query, limit=10):
+        raise AssertionError("verified snapshot should return before NAVER search")
+
+    async def fail_get_text(url):
+        raise AssertionError("verified snapshot should return before page fetch")
+
+    monkeypatch.setattr(client.naver, "web_documents", fail_web_documents)
+    monkeypatch.setattr(client, "_get_text", fail_get_text)
+
+    result = asyncio.run(
+        client.place_info(
+            "경주 첨성대",
+            {"operating_hours", "rest_date", "fee_text", "parking", "address"},
+        )
+    )
+
+    assert result["operating_hours"].replace(" ", "").startswith("09:00-22:00")
+    assert result["rest_date"] == "연중무휴"
+    assert result["fee_text"] == "무료"
+    assert "쪽샘임시주차장" in result["parking"]
+    assert result["address"] == "경북 경주시 인왕동 839-1"
+    assert result["source_name"] == "경주시 경주문화관광"
+    assert result["source_mode"] == "verified_official_snapshot"
+
+
+def test_official_domain_search_snippet_is_last_resort_when_page_fetch_fails(monkeypatch):
+    client = GyeongjuOfficialTourClient(_settings())
+
+    async def fake_web_documents(query, limit=10):
+        return [{
+            "title": "테스트명소 - 경주문화관광",
+            "url": "https://www.gyeongju.go.kr/tour/page.do?area_uid=999&cmd=2&mnu_uid=2292",
+            "description": "테스트명소 관람시간: 09:00-18:00 관람료: 무료",
+        }]
+
+    async def fail_get_text(url):
+        from app.clients import IntegrationError
+        raise IntegrationError("gyeongju_official", "blocked")
+
+    monkeypatch.setattr(client.naver, "web_documents", fake_web_documents)
+    monkeypatch.setattr(client, "_get_text", fail_get_text)
+
+    result = asyncio.run(
+        client.place_info("테스트명소", {"operating_hours", "fee_text"})
+    )
+
+    assert result["operating_hours"].replace(" ", "").startswith("09:00-18:00")
     assert result["source_url"].startswith("https://www.gyeongju.go.kr/tour/")

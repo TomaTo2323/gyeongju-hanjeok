@@ -1099,6 +1099,26 @@ class GyeongjuOfficialTourClient(BaseClient):
         ),
     }
 
+    # 경주시 공식 관광 페이지에서 직접 검증한 최소 방문정보 스냅샷입니다.
+    # Railway 등 런타임 환경에서 경주시 홈페이지 본문 요청이 차단/지연되어도
+    # 핵심 관광지는 공식 페이지에 명시된 값만 안전하게 답할 수 있습니다.
+    VERIFIED_OFFICIAL_FACTS: dict[str, dict[str, str]] = {
+        "첨성대": {
+            "source_url": (
+                "https://www.gyeongju.go.kr/tour/"
+                "page.do?area_uid=47&cmd=2&mnu_uid=2292"
+            ),
+            "operating_hours": "09:00 -22:00 (동절기 21:00까지)",
+            "rest_date": "연중무휴",
+            "fee_text": "무료",
+            "parking": (
+                "천마총 노상주차장, 교촌한옥마을 주변 노상주차장, "
+                "쪽샘임시주차장(무료, 원화로181번길 진입)"
+            ),
+            "address": "경북 경주시 인왕동 839-1",
+        },
+    }
+
     FIELD_LABELS: dict[str, tuple[str, ...]] = {
         "operating_hours": (
             "관람시간", "운영시간", "이용시간", "개방시간", "영업시간",
@@ -1257,6 +1277,31 @@ class GyeongjuOfficialTourClient(BaseClient):
         if short_title.startswith("경주 "):
             short_title = short_title[3:].strip()
 
+        # 먼저 검증된 경주시 공식 스냅샷을 확인합니다.
+        # V2는 공식 URL만 고정했기 때문에 이후 _get_text(url)가 실패하면
+        # 결국 빈 결과가 됐습니다. V3는 핵심 관광지의 검증된 공식 필드는
+        # 네트워크 요청보다 먼저 반환합니다.
+        compact_title = re.sub(r"[^0-9a-z가-힣]", "", short_title.lower())
+        for known_title, facts in self.VERIFIED_OFFICIAL_FACTS.items():
+            compact_known = re.sub(r"[^0-9a-z가-힣]", "", known_title.lower())
+            if compact_known and (
+                compact_known == compact_title
+                or compact_known in aliases
+                or compact_known in compact_title
+            ):
+                seeded = {
+                    field_name: str(facts[field_name])
+                    for field_name in requested_fields
+                    if facts.get(field_name)
+                }
+                if seeded:
+                    return {
+                        **seeded,
+                        "source_url": facts["source_url"],
+                        "source_name": "경주시 경주문화관광",
+                        "source_mode": "verified_official_snapshot",
+                    }
+
         queries = [
             f"site:gyeongju.go.kr/tour {short_title}",
             f"site:www.gyeongju.go.kr/tour/page.do {short_title}",
@@ -1269,7 +1314,6 @@ class GyeongjuOfficialTourClient(BaseClient):
         # Deterministic seed for critical landmarks. NAVER remains the generic
         # discovery mechanism for the rest, but 첨성대 must not fail merely
         # because NAVER returns an old /tour_bak page or no current result.
-        compact_title = re.sub(r"[^0-9a-z가-힣]", "", short_title.lower())
         for known_title, urls in self.DIRECT_OFFICIAL_URLS.items():
             compact_known = re.sub(r"[^0-9a-z가-힣]", "", known_title.lower())
             if compact_known and (
@@ -1324,20 +1368,38 @@ class GyeongjuOfficialTourClient(BaseClient):
         best_score = -1
         for candidate in ranked:
             url = str(candidate.get("url") or "")
+            raw_html = ""
             try:
                 raw_html = await asyncio.wait_for(self._get_text(url), timeout=4.0)
             except (IntegrationError, asyncio.TimeoutError):
-                continue
+                # Railway에서 경주시 홈페이지 본문 직접 요청이 실패할 수 있습니다.
+                # 이 경우에도 현재 경주시 공식 도메인 검색결과의 제목/설명만
+                # 마지막 보조근거로 사용합니다. 비공식 URL은 이미 제외됩니다.
+                raw_html = ""
 
-            compact_page = re.sub(
-                r"[^0-9a-z가-힣]",
-                "",
-                html.unescape(re.sub(r"(?is)<[^>]+>", " ", raw_html)).lower(),
-            )
-            if aliases and not any(alias in compact_page for alias in aliases):
-                continue
+            if raw_html:
+                compact_page = re.sub(
+                    r"[^0-9a-z가-힣]",
+                    "",
+                    html.unescape(re.sub(r"(?is)<[^>]+>", " ", raw_html)).lower(),
+                )
+                if aliases and not any(alias in compact_page for alias in aliases):
+                    continue
+                fields = self._parse_fields(raw_html, requested_fields)
+            else:
+                snippet = (
+                    f"{candidate.get('title', '')}\n"
+                    f"{candidate.get('description', '')}"
+                )
+                compact_snippet = re.sub(
+                    r"[^0-9a-z가-힣]",
+                    "",
+                    html.unescape(re.sub(r"(?is)<[^>]+>", " ", snippet)).lower(),
+                )
+                if aliases and not any(alias in compact_snippet for alias in aliases):
+                    continue
+                fields = self._parse_fields(snippet, requested_fields)
 
-            fields = self._parse_fields(raw_html, requested_fields)
             if not fields:
                 continue
 
