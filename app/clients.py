@@ -6,7 +6,7 @@ import json
 import re
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -1073,6 +1073,253 @@ class TourApiClient(BaseClient):
             tel=item.get("tel") or None,
             raw=item,
         )
+
+
+class GyeongjuOfficialTourClient(BaseClient):
+    """경주시 공식 문화관광 페이지에서 방문정보를 보완합니다.
+
+    TourAPI에 운영시간/휴무/요금/주차 같은 값이 비어 있을 때만 사용합니다.
+    NAVER 웹문서 검색은 *공식 페이지 URL을 찾는 용도*로만 사용하고,
+    실제 값은 gyeongju.go.kr의 공식 페이지 본문에서 다시 읽습니다.
+    """
+
+    OFFICIAL_HOSTS = {
+        "gyeongju.go.kr",
+        "www.gyeongju.go.kr",
+        "search.gyeongju.go.kr",
+    }
+
+    FIELD_LABELS: dict[str, tuple[str, ...]] = {
+        "operating_hours": (
+            "관람시간", "운영시간", "이용시간", "개방시간", "영업시간",
+        ),
+        "rest_date": (
+            "휴무일", "휴관일", "휴무", "휴관", "정기휴일",
+        ),
+        "fee_text": (
+            "관람료", "입장료", "이용료", "요금",
+        ),
+        "parking": (
+            "주차정보", "주차 안내", "주차안내", "주차",
+        ),
+        "tel": (
+            "전화", "문의전화", "문의처", "문의",
+        ),
+        "address": (
+            "주소", "위치",
+        ),
+    }
+
+    def __init__(self, settings: Settings):
+        super().__init__(settings)
+        self.naver = NaverClient(settings)
+
+    async def _get_text(self, url: str) -> str:
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (compatible; GyeongjuHanjeok/1.0; "
+                        "+https://www.gyeongju.go.kr/tour/)"
+                    )
+                },
+            ) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                return response.text
+        except httpx.HTTPStatusError as exc:
+            raise IntegrationError(
+                "gyeongju_official",
+                f"HTTP {exc.response.status_code}: {exc.response.text[:300]}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise IntegrationError("gyeongju_official", str(exc)) from exc
+
+    @classmethod
+    def _is_official_url(cls, url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return False
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+        return (
+            parsed.scheme in {"http", "https"}
+            and host in cls.OFFICIAL_HOSTS
+            and "/tour" in path
+            and "/tour_bak" not in path
+        )
+
+    @staticmethod
+    def _aliases(title: str) -> list[str]:
+        compact = re.sub(r"[^0-9a-z가-힣]", "", title.lower())
+        aliases = [compact] if compact else []
+        gyeongju = re.sub(r"[^0-9a-z가-힣]", "", "경주")
+        if compact.startswith(gyeongju) and len(compact) > len(gyeongju) + 1:
+            aliases.append(compact[len(gyeongju):])
+        return list(dict.fromkeys(alias for alias in aliases if len(alias) >= 2))
+
+    @staticmethod
+    def _html_lines(raw_html: str) -> list[str]:
+        text = re.sub(
+            r"(?is)<(?:script|style|noscript)[^>]*>.*?</(?:script|style|noscript)>",
+            " ",
+            raw_html,
+        )
+        text = re.sub(
+            r"(?is)<br\s*/?>|</(?:p|div|li|tr|td|th|dd|dt|section|article|h[1-6])>",
+            "\n",
+            text,
+        )
+        text = re.sub(r"(?is)<[^>]+>", " ", text)
+        text = html.unescape(text).replace("\xa0", " ")
+        lines: list[str] = []
+        for raw_line in text.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip(" \t:-·|/")
+            if line:
+                lines.append(line)
+        return lines
+
+    @classmethod
+    def _extract_labeled_value(
+        cls,
+        lines: list[str],
+        labels: tuple[str, ...],
+    ) -> str | None:
+        for index, line in enumerate(lines):
+            for label in labels:
+                pos = line.find(label)
+                if pos < 0:
+                    continue
+
+                value = line[pos + len(label):].strip(" \t:：-·|")
+                if not value and index + 1 < len(lines):
+                    value = lines[index + 1].strip()
+
+                # 메뉴/내비게이션에 잡힌 한 단어 라벨은 값으로 쓰지 않습니다.
+                if not value or value == label:
+                    continue
+
+                value = re.sub(r"\s+", " ", value).strip()
+                if 1 <= len(value) <= 500:
+                    return value
+        return None
+
+    @classmethod
+    def _parse_fields(
+        cls,
+        raw_html: str,
+        requested_fields: set[str],
+    ) -> dict[str, str]:
+        lines = cls._html_lines(raw_html)
+        result: dict[str, str] = {}
+
+        for field_name in requested_fields:
+            labels = cls.FIELD_LABELS.get(field_name)
+            if not labels:
+                continue
+            value = cls._extract_labeled_value(lines, labels)
+            if value:
+                result[field_name] = value
+
+        # 경주문화관광은 "관람시간 ... 연중무휴"처럼 휴무정보를 같은 줄에
+        # 함께 표기하는 경우가 많습니다.
+        if "rest_date" in requested_fields and "rest_date" not in result:
+            hours = result.get("operating_hours")
+            if hours and "연중무휴" in hours:
+                result["rest_date"] = "연중무휴"
+
+        return result
+
+    async def place_info(
+        self,
+        title: str,
+        requested_fields: set[str],
+    ) -> dict[str, Any]:
+        if not requested_fields:
+            return {}
+
+        aliases = self._aliases(title)
+        short_title = title.strip()
+        if short_title.startswith("경주 "):
+            short_title = short_title[3:].strip()
+
+        queries = [
+            f"경주문화관광 {short_title}",
+            f"{short_title} 관람시간 경주문화관광",
+        ]
+
+        candidates: dict[str, dict[str, Any]] = {}
+        for query in queries:
+            try:
+                documents = await self.naver.web_documents(query, limit=10)
+            except IntegrationError:
+                continue
+
+            for document in documents:
+                url = str(document.get("url") or "").strip()
+                if not self._is_official_url(url):
+                    continue
+
+                searchable = re.sub(
+                    r"[^0-9a-z가-힣]",
+                    "",
+                    f"{document.get('title', '')} {document.get('description', '')}".lower(),
+                )
+                alias_match = max(
+                    (len(alias) for alias in aliases if alias in searchable),
+                    default=0,
+                )
+                score = alias_match * 10
+                if "www.gyeongju.go.kr/tour/" in url:
+                    score += 5
+                if "page.do" in url:
+                    score += 2
+
+                previous = candidates.get(url)
+                if previous is None or score > previous["score"]:
+                    candidates[url] = {**document, "score": score}
+
+        ranked = sorted(
+            candidates.values(),
+            key=lambda item: item["score"],
+            reverse=True,
+        )[:5]
+
+        best: dict[str, Any] = {}
+        best_score = -1
+        for candidate in ranked:
+            url = str(candidate.get("url") or "")
+            try:
+                raw_html = await asyncio.wait_for(self._get_text(url), timeout=4.0)
+            except (IntegrationError, asyncio.TimeoutError):
+                continue
+
+            compact_page = re.sub(
+                r"[^0-9a-z가-힣]",
+                "",
+                html.unescape(re.sub(r"(?is)<[^>]+>", " ", raw_html)).lower(),
+            )
+            if aliases and not any(alias in compact_page for alias in aliases):
+                continue
+
+            fields = self._parse_fields(raw_html, requested_fields)
+            if not fields:
+                continue
+
+            score = len(fields) * 100 + int(candidate.get("score") or 0)
+            if score > best_score:
+                best_score = score
+                best = {
+                    **fields,
+                    "source_url": url,
+                    "source_name": "경주시 경주문화관광",
+                }
+
+        return best
 
 
 class RegionalVisitorClient(BaseClient):

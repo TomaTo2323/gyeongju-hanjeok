@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from .clients import (
     CongestionClient,
+    GyeongjuOfficialTourClient,
     IntegrationError,
     KakaoLocalClient,
     KakaoRouteClient,
@@ -7195,6 +7196,7 @@ class RagService:
         self.db = db
         self.openai = OpenAIClient(settings)
         self.tour = TourApiClient(settings)
+        self.official_tour = GyeongjuOfficialTourClient(settings)
 
     @classmethod
     def _place_aliases(cls, title: str) -> list[str]:
@@ -7313,20 +7315,66 @@ class RagService:
         try:
             detailed = await asyncio.wait_for(self.tour.detail(place), timeout=4.0)
         except (IntegrationError, asyncio.TimeoutError):
+            detailed = None
+
+        if detailed is not None:
+            refreshed = detailed.model_dump(mode="json")
+            record.title = detailed.title
+            record.category = detailed.category
+            record.latitude = detailed.latitude
+            record.longitude = detailed.longitude
+            record.data = refreshed
+            record.updated_at = datetime.now(timezone.utc)
+
+            try:
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+
+        data = record.data or {}
+        still_missing = {
+            field_name
+            for field_name, _ in fields
+            if not self._clean_structured_value(data.get(field_name))
+        }
+
+        if not still_missing:
             return record
 
-        refreshed = detailed.model_dump(mode="json")
-        record.title = detailed.title
-        record.category = detailed.category
-        record.latitude = detailed.latitude
-        record.longitude = detailed.longitude
-        record.data = refreshed
-        record.updated_at = datetime.now(timezone.utc)
-
+        # TourAPI에도 값이 없다면 경주시 공식 경주문화관광 페이지를 마지막
+        # 공공 fallback으로 확인합니다. NAVER는 공식 URL 탐색에만 사용하며,
+        # 실제 값은 gyeongju.go.kr 본문에서 직접 추출합니다.
         try:
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
+            official = await asyncio.wait_for(
+                self.official_tour.place_info(record.title, still_missing),
+                timeout=8.0,
+            )
+        except (IntegrationError, asyncio.TimeoutError):
+            official = {}
+
+        if not official:
+            return record
+
+        merged = dict(record.data or {})
+        official_fields: list[str] = list(merged.get("official_fallback_fields") or [])
+        for field_name in still_missing:
+            value = self._clean_structured_value(official.get(field_name))
+            if not value:
+                continue
+            merged[field_name] = value
+            if field_name not in official_fields:
+                official_fields.append(field_name)
+
+        if official_fields:
+            merged["official_fallback_fields"] = official_fields
+            merged["official_source_name"] = official.get("source_name") or "경주시 경주문화관광"
+            merged["official_source_url"] = official.get("source_url")
+            record.data = merged
+            record.updated_at = datetime.now(timezone.utc)
+            try:
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
 
         return record
 
@@ -7367,10 +7415,16 @@ class RagService:
                 missing_labels.append(label)
 
         if len(fields) == 1:
-            label = fields[0][1]
+            field_name, label = fields[0]
             if values:
+                official_fields = set(data.get("official_fallback_fields") or [])
+                source_label = (
+                    data.get("official_source_name") or "경주시 경주문화관광"
+                    if field_name in official_fields
+                    else "관광공사 등록 자료"
+                )
                 return (
-                    f"관광공사 등록 자료 기준, {record.title}의 {label}은 {values[0][1]}입니다.",
+                    f"{source_label} 기준, {record.title}의 {label}은 {values[0][1]}입니다.",
                     True,
                 )
             return (
@@ -7381,8 +7435,15 @@ class RagService:
 
         chunks = [f"{label}: {value}" for label, value in values]
         chunks.extend(f"{label}: 확인되지 않음" for label in missing_labels)
+        official_fields = set(data.get("official_fallback_fields") or [])
+        requested_names = {field_name for field_name, _ in fields}
+        source_label = (
+            "관광공사·경주시 공식 관광정보"
+            if official_fields & requested_names
+            else "관광공사 등록 자료"
+        )
         return (
-            f"관광공사 등록 자료 기준, {record.title} 방문 정보입니다. " + " / ".join(chunks),
+            f"{source_label} 기준, {record.title} 방문 정보입니다. " + " / ".join(chunks),
             bool(values),
         )
 

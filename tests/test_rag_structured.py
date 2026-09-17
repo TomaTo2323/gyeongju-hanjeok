@@ -156,3 +156,59 @@ def test_general_rag_prioritizes_named_place_and_limits_knowledge_docs(monkeypat
     # top_k=5일 때 장소 최대 5 + 지식문서 최대 6개만 LLM에 전달한다.
     assert len(captured["contexts"]) == 7
     assert captured["contexts"][0]["title"] == "첨성대"
+
+
+def test_structured_hours_falls_back_to_gyeongju_official_when_tourapi_missing(monkeypatch):
+    db = _session()
+    db.add(
+        PlaceRecord(
+            place_id="126160",
+            title="경주 첨성대",
+            category="관광지",
+            latitude=35.8347,
+            longitude=129.2191,
+            data={
+                "place_id": "126160",
+                "title": "경주 첨성대",
+                "category": "관광지",
+                "latitude": 35.8347,
+                "longitude": 129.2191,
+                "operating_hours": None,
+                "address": "경상북도 경주시 인왕동 839-1",
+            },
+            embedding=None,
+        )
+    )
+    db.commit()
+
+    service = RagService(_settings(), db)
+
+    async def tour_detail_still_missing(place):
+        return place
+
+    async def official_info(title, requested_fields):
+        assert "operating_hours" in requested_fields
+        return {
+            "operating_hours": "09:00-22:00(동절기 21:00까지), 연중무휴",
+            "source_name": "경주시 경주문화관광",
+            "source_url": "https://www.gyeongju.go.kr/tour/page.do?area_uid=47&cmd=2&mnu_uid=2292",
+        }
+
+    async def embeddings_must_not_run(texts):  # pragma: no cover - failure path
+        raise AssertionError("structured query must not call OpenAI embeddings")
+
+    monkeypatch.setattr(service.tour, "detail", tour_detail_still_missing)
+    monkeypatch.setattr(service.official_tour, "place_info", official_info)
+    monkeypatch.setattr(service.openai, "embeddings", embeddings_must_not_run)
+
+    result = asyncio.run(service.search("첨성대 운영시간 알려줘", 5))
+
+    assert result.grounded is True
+    assert "경주시 경주문화관광 기준" in result.answer
+    assert "09:00-22:00" in result.answer
+
+    saved = db.get(PlaceRecord, "126160")
+    assert saved is not None
+    assert saved.data["operating_hours"].startswith("09:00-22:00")
+    assert "operating_hours" in saved.data["official_fallback_fields"]
+    assert saved.data["official_source_url"].startswith("https://www.gyeongju.go.kr/tour/")
