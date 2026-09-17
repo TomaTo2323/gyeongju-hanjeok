@@ -1448,13 +1448,43 @@ class KoreanHeritageClient(BaseClient):
             raise IntegrationError("korean_heritage", str(exc)) from exc
 
     @staticmethod
-    def _xml_value(item: ET.Element | None, name: str) -> str:
+    def _local_xml_name(tag: object) -> str:
+        text = str(tag or "")
+        if "}" in text:
+            text = text.rsplit("}", 1)[-1]
+        return text.lower()
+
+    @classmethod
+    def _xml_value(cls, item: ET.Element | None, name: str) -> str:
+        """국가유산청 XML 필드를 대소문자/네임스페이스 차이에 강하게 읽습니다.
+
+        오래 운영된 Open API 특성상 camelCase/lowercase 예시가 혼재할 수 있습니다.
+        ElementTree의 find()는 대소문자를 구분하므로, 필드가 실제로 있어도 빈 값으로
+        인식되는 문제를 막기 위해 로컬 태그명을 소문자로 비교하고 하위 노드까지 읽습니다.
+        """
         if item is None:
             return ""
-        node = item.find(name)
-        if node is None or node.text is None:
-            return ""
-        return re.sub(r"\s+", " ", node.text).strip()
+        wanted = name.lower()
+        for node in item.iter():
+            if cls._local_xml_name(node.tag) != wanted:
+                continue
+            value = " ".join(
+                part.strip()
+                for part in node.itertext()
+                if part and part.strip()
+            )
+            value = re.sub(r"\s+", " ", value).strip()
+            if value:
+                return value
+        return ""
+
+    @classmethod
+    def _xml_items(cls, root: ET.Element) -> list[ET.Element]:
+        return [
+            node
+            for node in root.iter()
+            if cls._local_xml_name(node.tag) == "item"
+        ]
 
     @staticmethod
     def _compact(value: str) -> str:
@@ -1497,6 +1527,7 @@ class KoreanHeritageClient(BaseClient):
                 "ccbaMnm1": short_title,
                 "pageUnit": 20,
                 "pageIndex": 1,
+                "ccbaCncl": "N",
             },
         )
         try:
@@ -1507,7 +1538,7 @@ class KoreanHeritageClient(BaseClient):
         candidates = sorted(
             (
                 (self._candidate_score(item, short_title), item)
-                for item in root.findall(".//item")
+                for item in self._xml_items(root)
             ),
             key=lambda pair: pair[0],
             reverse=True,
@@ -1522,38 +1553,82 @@ class KoreanHeritageClient(BaseClient):
             if not (kind and number and province_code):
                 continue
 
-            detail_raw = await self._get_xml(
-                self.DETAIL_URL,
-                params={
-                    "ccbaKdcd": kind,
-                    "ccbaAsno": number,
-                    "ccbaCtcd": province_code,
-                },
-            )
+            # 상세 endpoint가 일시 실패하더라도 목록 결과에 설명/시대/주소가 있으면
+            # 국가유산 공식 근거를 버리지 않습니다.
+            detail: ET.Element | None = None
             try:
+                detail_raw = await self._get_xml(
+                    self.DETAIL_URL,
+                    params={
+                        "ccbaKdcd": kind,
+                        "ccbaAsno": number,
+                        "ccbaCtcd": province_code,
+                    },
+                )
                 detail_root = ET.fromstring(detail_raw)
-            except ET.ParseError:
-                continue
-            detail = detail_root.find(".//item")
-            if detail is None:
-                continue
+                detail_items = self._xml_items(detail_root)
+                detail = detail_items[0] if detail_items else None
+            except (IntegrationError, ET.ParseError, ValueError):
+                detail = None
 
-            name = self._xml_value(detail, "ccbaMnm1") or self._xml_value(item, "ccbaMnm1")
-            content = self._xml_value(detail, "content")
+            source = detail if detail is not None else item
+            name = (
+                self._xml_value(source, "ccbaMnm1")
+                or self._xml_value(item, "ccbaMnm1")
+            )
+            content = (
+                self._xml_value(source, "content")
+                or self._xml_value(item, "content")
+            )
             fields = [
-                ("국가유산 종목", self._xml_value(detail, "ccmaName")),
-                ("시대", self._xml_value(detail, "ccceName")),
-                ("소재지", self._xml_value(detail, "ccbaLcad")),
-                ("관리자", self._xml_value(detail, "ccbaAdmin")),
+                (
+                    "국가유산 종목",
+                    self._xml_value(source, "ccmaName")
+                    or self._xml_value(item, "ccmaName"),
+                ),
+                (
+                    "시대",
+                    self._xml_value(source, "ccceName")
+                    or self._xml_value(item, "ccceName"),
+                ),
+                (
+                    "소재지",
+                    self._xml_value(source, "ccbaLcad")
+                    or self._xml_value(item, "ccbaLcad"),
+                ),
+                (
+                    "관리자",
+                    self._xml_value(source, "ccbaAdmin")
+                    or self._xml_value(item, "ccbaAdmin"),
+                ),
             ]
-            prefix = " / ".join(f"{label}: {value}" for label, value in fields if value)
-            overview = "\n".join(part for part in (prefix, content) if part).strip()
+            prefix = " / ".join(
+                f"{label}: {value}"
+                for label, value in fields
+                if value
+            )
+            overview = "\n".join(
+                part for part in (prefix, content) if part
+            ).strip()
             if not overview:
                 continue
 
-            source_url = (
-                f"{self.DETAIL_URL}?ccbaKdcd={kind}&ccbaAsno={number}&ccbaCtcd={province_code}"
+            cpno = (
+                self._xml_value(source, "ccbaCpno")
+                or self._xml_value(item, "ccbaCpno")
             )
+            if cpno:
+                source_url = (
+                    "https://m.khs.go.kr/public/commentary/culSelectDetail.do"
+                    f"?ccbaAsno={number}&ccbaCpno={cpno}"
+                    f"&ccbaCtcd={province_code}&ccbaKdcd={kind}&menuId=03"
+                )
+            else:
+                source_url = (
+                    f"{self.DETAIL_URL}?ccbaKdcd={kind}"
+                    f"&ccbaAsno={number}&ccbaCtcd={province_code}"
+                )
+
             results.append(
                 {
                     "title": f"국가유산청 - {name}",

@@ -247,3 +247,72 @@ def test_trusted_daum_snippet_is_used_when_original_fetch_fails(monkeypatch):
     assert any("국립경주박물관" in query for query in search_calls)
     assert any(hit.category == "공식 웹검색 요약" for hit in result.hits)
 
+
+def test_heritage_client_parses_lowercase_xml_tags(monkeypatch):
+    client = KoreanHeritageClient(_settings())
+    list_xml = """
+    <result><item>
+      <ccbamnm1>경주 석굴암 석굴</ccbamnm1>
+      <ccbactcdnm>경상북도</ccbactcdnm>
+      <ccsiname>경주시</ccsiname>
+      <ccbakdcd>11</ccbakdcd>
+      <ccbaasno>00240000</ccbaasno>
+      <ccbactcd>37</ccbactcd>
+      <ccbacncl>N</ccbacncl>
+      <ccbacpno>1113700240000</ccbacpno>
+    </item></result>
+    """
+    detail_xml = """
+    <result><item>
+      <ccbamnm1>경주 석굴암 석굴</ccbamnm1>
+      <ccmaname>국보</ccmaname>
+      <cccename>통일신라</cccename>
+      <ccbalcad>경상북도 경주시</ccbalcad>
+      <ccbaadmin>불국사</ccbaadmin>
+      <ccbacndt><content>석굴암은 신라 경덕왕 10년(751)에 김대성이 창건을 시작하여 혜공왕 10년(774)에 완성하였다.</content></ccbacndt>
+    </item></result>
+    """
+
+    async def fake_get_xml(url, *, params):
+        return detail_xml if "Dt.do" in url else list_xml
+
+    monkeypatch.setattr(client, "_get_xml", fake_get_xml)
+    result = asyncio.run(client.contexts("석굴암", limit=2))
+
+    assert len(result) == 1
+    assert "751" in result[0]["overview"]
+    assert "774" in result[0]["overview"]
+    assert result[0]["source_name"] == "국가유산청"
+    assert "m.khs.go.kr" in result[0]["source_url"]
+
+
+def test_heritage_client_uses_list_content_when_detail_fails(monkeypatch):
+    from app.clients import IntegrationError
+
+    client = KoreanHeritageClient(_settings())
+    list_xml = """
+    <result><item>
+      <ccbaMnm1>경주 석굴암 석굴</ccbaMnm1>
+      <ccbaCtcdNm>경상북도</ccbaCtcdNm>
+      <ccsiName>경주시</ccsiName>
+      <ccbaKdcd>11</ccbaKdcd>
+      <ccbaAsno>00240000</ccbaAsno>
+      <ccbaCtcd>37</ccbaCtcd>
+      <ccbaCncl>N</ccbaCncl>
+      <ccceName>통일신라</ccceName>
+      <content>석굴암은 751년에 창건을 시작하여 774년에 완성하였다.</content>
+    </item></result>
+    """
+
+    async def fake_get_xml(url, *, params):
+        if "Dt.do" in url:
+            raise IntegrationError("korean_heritage", "detail unavailable")
+        return list_xml
+
+    monkeypatch.setattr(client, "_get_xml", fake_get_xml)
+    result = asyncio.run(client.contexts("석굴암", limit=1))
+
+    assert len(result) == 1
+    assert "751" in result[0]["overview"]
+    assert "774" in result[0]["overview"]
+
