@@ -1261,13 +1261,35 @@ async def _quick_overview_from_naver(
             return []
 
     async def naver_web_docs():
-        try:
-            return await naver.web_documents(
-                f"경주 {place.title} 소개",
-                limit=12,
-            )
-        except IntegrationError:
-            return []
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for query in (
+            f"경주 {place.title} 소개",
+            f"{place.title} 경주문화관광",
+            f"{place.title} 경주 여행 권역별 관광지",
+            f"{place.title} site:gyeongju.go.kr/tour",
+        ):
+            try:
+                found = await naver.web_documents(
+                    query,
+                    limit=12,
+                )
+            except IntegrationError:
+                continue
+
+            for row in found:
+                url = str(row.get("url") or "").strip()
+                key = url or (
+                    str(row.get("title") or "")
+                    + str(row.get("description") or "")
+                )
+
+                if key and key not in seen:
+                    seen.add(key)
+                    rows.append(row)
+
+        return rows
 
     async def kakao_web_docs():
         rows: list[dict[str, Any]] = []
@@ -1275,6 +1297,8 @@ async def _quick_overview_from_naver(
         for query in (
             f"경주 {place.title}",
             f"{place.title} 경주문화관광",
+            f"{place.title} 경주 여행 권역별 관광지",
+            f"{place.title} site:gyeongju.go.kr/tour",
         ):
             try:
                 found = await kakao.web_search(
@@ -1471,28 +1495,16 @@ async def _quick_overview_from_naver(
     ]
 
     if repeated:
-        category = _front_place_category(place)
-        features = "·".join(repeated[:2])
-
+        # 블로그에서 반복되는 키워드는 참고 신호일 뿐,
+        # 실제 "장소 소개" 문장으로 만들어 노출하지 않습니다.
+        # 이전에는 여기서
+        # "OO. 숲 관련 방문 후기가 반복적으로 확인되는 관광지입니다."
+        # 같은 일반 문장이 만들어져 공식 소개 대신 표시될 수 있었습니다.
         print(
             "[PLACE OVERVIEW SEARCH]",
             f"title={place.title!r}",
-            "source=naver_blog_consensus",
-        )
-
-        if category in {"맛집", "카페"}:
-            return (
-                f"{place.title}. {features} 관련 방문 후기가 "
-                f"반복적으로 확인되는 {category}입니다.",
-                "naver_blog_consensus",
-                None,
-            )
-
-        return (
-            f"{place.title}. {features} 관련 방문 후기가 "
-            "반복적으로 확인되는 관광지입니다.",
-            "naver_blog_consensus",
-            None,
+            "source=naver_blog_consensus_skipped_for_overview",
+            f"features={repeated[:2]}",
         )
 
     print(
