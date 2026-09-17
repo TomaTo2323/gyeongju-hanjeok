@@ -497,11 +497,24 @@ class TourApiClient(BaseClient):
         법정동 코드(경주시 47/130) 방식으로 한 번 더 조회합니다.
         """
         ymd = travel_date.strftime("%Y%m%d")
+
+        # searchFestival2의 eventStartDate는 "그 날짜 이후 시작하는 행사"를
+        # 찾는 기준이므로 여행 날짜만 넣으면 이미 시작해서 진행 중인 장기
+        # 행사가 누락될 수 있습니다.
+        #
+        # 따라서 여행일 기준 최대 366일 전부터 여행일까지 넓게 조회한 뒤,
+        # 아래의 start <= travel_date <= end 검증으로 실제 여행일에 진행 중인
+        # 행사만 남깁니다. 사용자 GPS는 이 요청에 전혀 사용하지 않습니다.
+        query_start_date = travel_date - timedelta(days=366)
+        query_start_ymd = query_start_date.strftime("%Y%m%d")
+
         common = self._auth_params() | {
-            "eventStartDate": ymd,
+            "eventStartDate": query_start_ymd,
             "eventEndDate": ymd,
             "arrange": "C",
-            "numOfRows": min(max(1, limit), 100),
+            # 넓은 조회 구간에서 진행 중 행사를 놓치지 않도록 한 페이지 최대치를
+            # 요청하고, 실제 반환 개수는 아래에서 limit으로 다시 제한합니다.
+            "numOfRows": 100,
             "pageNo": 1,
         }
 
