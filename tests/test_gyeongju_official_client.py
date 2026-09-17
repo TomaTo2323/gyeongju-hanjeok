@@ -80,3 +80,35 @@ def test_official_client_uses_only_current_gyeongju_tour_pages(monkeypatch):
     assert result["fee_text"] == "무료"
     assert result["source_name"] == "경주시 경주문화관광"
     assert result["source_url"].startswith("https://www.gyeongju.go.kr/tour/")
+
+
+def test_official_client_direct_seed_works_without_naver_results(monkeypatch):
+    client = GyeongjuOfficialTourClient(_settings())
+
+    async def empty_web_documents(query, limit=10):
+        return []
+
+    async def fake_get_text(url):
+        assert url == (
+            "https://www.gyeongju.go.kr/tour/"
+            "page.do?area_uid=47&cmd=2&mnu_uid=2292"
+        )
+        return """
+        <html><body><h1>첨성대</h1>
+        <li>관람시간 : 09:00 -22:00(동절기 21:00까지), 연중무휴</li>
+        <li>관람료 : 무료</li>
+        <li>주차정보 : 천마총 노상주차장, 쪽샘임시주차장(무료)</li>
+        </body></html>
+        """
+
+    monkeypatch.setattr(client.naver, "web_documents", empty_web_documents)
+    monkeypatch.setattr(client, "_get_text", fake_get_text)
+
+    result = asyncio.run(
+        client.place_info("경주 첨성대", {"operating_hours", "fee_text", "parking"})
+    )
+
+    assert result["operating_hours"].startswith("09:00 -22:00")
+    assert result["fee_text"] == "무료"
+    assert "쪽샘임시주차장" in result["parking"]
+    assert result["source_url"].startswith("https://www.gyeongju.go.kr/tour/")

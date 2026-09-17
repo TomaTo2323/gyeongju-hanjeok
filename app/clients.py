@@ -1089,6 +1089,16 @@ class GyeongjuOfficialTourClient(BaseClient):
         "search.gyeongju.go.kr",
     }
 
+    # NAVER web search can occasionally return only old /tour_bak pages or no
+    # current official result. Keep a very small deterministic seed map for
+    # critical landmarks whose canonical current Gyeongju Tourism URL is known.
+    # Generic places still use domain-scoped NAVER discovery below.
+    DIRECT_OFFICIAL_URLS: dict[str, tuple[str, ...]] = {
+        "첨성대": (
+            "https://www.gyeongju.go.kr/tour/page.do?area_uid=47&cmd=2&mnu_uid=2292",
+        ),
+    }
+
     FIELD_LABELS: dict[str, tuple[str, ...]] = {
         "operating_hours": (
             "관람시간", "운영시간", "이용시간", "개방시간", "영업시간",
@@ -1248,11 +1258,32 @@ class GyeongjuOfficialTourClient(BaseClient):
             short_title = short_title[3:].strip()
 
         queries = [
+            f"site:gyeongju.go.kr/tour {short_title}",
+            f"site:www.gyeongju.go.kr/tour/page.do {short_title}",
             f"경주문화관광 {short_title}",
             f"{short_title} 관람시간 경주문화관광",
         ]
 
         candidates: dict[str, dict[str, Any]] = {}
+
+        # Deterministic seed for critical landmarks. NAVER remains the generic
+        # discovery mechanism for the rest, but 첨성대 must not fail merely
+        # because NAVER returns an old /tour_bak page or no current result.
+        compact_title = re.sub(r"[^0-9a-z가-힣]", "", short_title.lower())
+        for known_title, urls in self.DIRECT_OFFICIAL_URLS.items():
+            compact_known = re.sub(r"[^0-9a-z가-힣]", "", known_title.lower())
+            if compact_known and (
+                compact_known == compact_title
+                or compact_known in aliases
+                or compact_known in compact_title
+            ):
+                for url in urls:
+                    candidates[url] = {
+                        "title": known_title,
+                        "url": url,
+                        "description": "경주시 경주문화관광 공식 페이지",
+                        "score": 3000,
+                    }
         for query in queries:
             try:
                 documents = await self.naver.web_documents(query, limit=10)
