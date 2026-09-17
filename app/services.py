@@ -14,6 +14,9 @@ from sqlalchemy.orm import Session
 from .clients import (
     CongestionClient,
     GyeongjuOfficialTourClient,
+    KoreanHeritageClient,
+    DaumSearchClient,
+    TrustedWebSourceClient,
     IntegrationError,
     KakaoLocalClient,
     KakaoRouteClient,
@@ -7197,6 +7200,9 @@ class RagService:
         self.openai = OpenAIClient(settings)
         self.tour = TourApiClient(settings)
         self.official_tour = GyeongjuOfficialTourClient(settings)
+        self.heritage = KoreanHeritageClient(settings)
+        self.daum = DaumSearchClient(settings)
+        self.trusted_web = TrustedWebSourceClient(settings)
 
     @classmethod
     def _place_aliases(cls, title: str) -> list[str]:
@@ -7447,6 +7453,187 @@ class RagService:
             bool(values),
         )
 
+    @staticmethod
+    def _answer_needs_external_fallback(answer: str) -> bool:
+        compact = re.sub(r"\s+", " ", answer or "").strip()
+        return any(
+            phrase in compact
+            for phrase in (
+                "확인할 수 있는 자료가 부족",
+                "자료가 부족",
+                "확인할 수 없습니다",
+                "정보를 확인할 수 없습니다",
+            )
+        )
+
+    @staticmethod
+    def _external_hit(context: dict, index: int) -> RagHit:
+        source_url = str(context.get("source_url") or context.get("homepage") or "")
+        source_name = str(context.get("source_name") or "공식 자료")
+        return RagHit(
+            source_type="etiquette",
+            place_id=source_url or f"external-{index}",
+            title=str(context.get("title") or source_name),
+            category=str(context.get("category") or "공식 웹자료"),
+            similarity=1.0,
+            overview=context.get("overview"),
+            homepage=source_url or None,
+        )
+
+    @staticmethod
+    def _clean_search_title(value: object) -> str:
+        text = re.sub(r"<[^>]+>", " ", str(value or ""))
+        return re.sub(r"\s+", " ", text).strip()
+
+    async def _external_official_contexts(
+        self,
+        query: str,
+        exact_place: PlaceRecord | None,
+    ) -> list[dict]:
+        """내부 RAG가 부족할 때 공식 외부자료를 단계적으로 수집합니다.
+
+        순서:
+        1) 국가유산청 공개 Open API
+        2) Daum 웹문서 검색
+        3) 신뢰 도메인으로 판정된 원문 URL만 직접 fetch
+
+        Daum의 검색 스니펫은 답변 근거로 직접 쓰지 않습니다.
+        """
+        subject = exact_place.title if exact_place is not None else query
+        short_subject = subject.strip()
+        if short_subject.startswith("경주 "):
+            short_subject = short_subject[3:].strip()
+
+        contexts: list[dict] = []
+        seen_urls: set[str] = set()
+
+        # 1) 국가유산청 공식 Open API. 장애 시 다음 단계로 조용히 넘어갑니다.
+        try:
+            heritage_contexts = await asyncio.wait_for(
+                self.heritage.contexts(short_subject, limit=2),
+                timeout=6.0,
+            )
+        except (IntegrationError, asyncio.TimeoutError, ValueError):
+            heritage_contexts = []
+
+        for context in heritage_contexts:
+            url = str(context.get("source_url") or "")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            contexts.append(context)
+
+        # 2) Daum 검색은 URL discovery만 담당합니다. 광범위 검색 + 국가유산/박물관
+        #    도메인 검색을 함께 해 공식 원문을 찾을 확률을 높입니다.
+        search_queries = [
+            f"{short_subject} {query}",
+            f"site:khs.go.kr {short_subject} {query}",
+            f"site:gyeongju.museum.go.kr {short_subject} {query}",
+            f"site:museum.go.kr {short_subject} {query}",
+        ]
+        documents: list[dict] = []
+        seen_search_urls: set[str] = set()
+        for search_query in search_queries:
+            try:
+                found = await asyncio.wait_for(
+                    self.daum.web_documents(search_query, limit=12),
+                    timeout=4.0,
+                )
+            except (IntegrationError, asyncio.TimeoutError, ValueError):
+                continue
+            for document in found:
+                url = str(document.get("url") or "").strip()
+                if not url or url in seen_search_urls:
+                    continue
+                source_name = self.trusted_web.trusted_source_name(url)
+                if not source_name:
+                    continue
+                seen_search_urls.add(url)
+                searchable = normalize_name(
+                    f"{document.get('title', '')} {document.get('contents', '')}"
+                )
+                subject_key = normalize_name(short_subject)
+                query_tokens = [
+                    token
+                    for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query)
+                    if token not in {"알려줘", "알려", "누구", "뭐야", "어디", "경주"}
+                ]
+                score = 0
+                if subject_key and subject_key in searchable:
+                    score += 100
+                score += sum(5 for token in query_tokens if normalize_name(token) in searchable)
+                source_bonus = {
+                    "국가유산청": 40,
+                    "국가유산포털": 38,
+                    "국립문화유산연구원": 36,
+                    "국립경주박물관": 35,
+                    "국립중앙박물관": 34,
+                    "경주시": 28,
+                    "대한민국 구석구석": 20,
+                }.get(source_name, 0)
+                documents.append({**document, "source_name": source_name, "_score": score + source_bonus})
+
+        documents.sort(key=lambda item: int(item.get("_score") or 0), reverse=True)
+        fetch_candidates = [doc for doc in documents if str(doc.get("url") or "") not in seen_urls][:5]
+
+        async def _fetch(document: dict):
+            url = str(document.get("url") or "")
+            try:
+                result = await asyncio.wait_for(
+                    self.trusted_web.fetch_document(
+                        url,
+                        query=query,
+                        title=short_subject,
+                    ),
+                    timeout=5.0,
+                )
+            except (IntegrationError, asyncio.TimeoutError, ValueError):
+                return None
+            if result:
+                page_title = self._clean_search_title(document.get("title"))
+                if page_title:
+                    result["title"] = f"{result.get('source_name', '공식 자료')} - {page_title}"
+            return result
+
+        fetched = await asyncio.gather(
+            *(_fetch(document) for document in fetch_candidates),
+            return_exceptions=False,
+        ) if fetch_candidates else []
+
+        for context in fetched:
+            if not context:
+                continue
+            url = str(context.get("source_url") or "")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            contexts.append(context)
+            if len(contexts) >= 5:
+                break
+
+        return contexts[:5]
+
+    async def _external_fallback_response(
+        self,
+        query: str,
+        history: list[ChatTurn],
+        exact_place: PlaceRecord | None,
+    ) -> RagSearchResponse | None:
+        contexts = await self._external_official_contexts(query, exact_place)
+        if not contexts:
+            return None
+
+        answer = await self.openai.answer_with_context(query, contexts, history=history)
+        grounded = not self._answer_needs_external_fallback(answer)
+        return RagSearchResponse(
+            query=query,
+            answer=answer,
+            hits=[self._external_hit(context, index) for index, context in enumerate(contexts)],
+            grounded=grounded,
+        )
+
     async def search(
         self,
         query: str,
@@ -7537,6 +7724,11 @@ class RagService:
         )
 
         if not selected or selected[0][0] < self.settings.rag_min_similarity:
+            external = await self._external_fallback_response(
+                query, history, exact_place
+            )
+            if external is not None:
+                return external
             return RagSearchResponse(
                 query=query,
                 answer=(
@@ -7581,10 +7773,18 @@ class RagService:
 
         answer = await self.openai.answer_with_context(query, contexts, history=history)
 
+        if self._answer_needs_external_fallback(answer):
+            external = await self._external_fallback_response(
+                query, history, exact_place
+            )
+            if external is not None:
+                return external
+
         return RagSearchResponse(
             query=query,
             answer=answer,
             hits=hits,
+            grounded=not self._answer_needs_external_fallback(answer),
         )
 
 def _cosine(

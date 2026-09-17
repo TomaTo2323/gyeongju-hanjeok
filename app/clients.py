@@ -7,6 +7,7 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
+import xml.etree.ElementTree as ET
 
 import httpx
 
@@ -1413,6 +1414,329 @@ class GyeongjuOfficialTourClient(BaseClient):
                 }
 
         return best
+
+
+class KoreanHeritageClient(BaseClient):
+    """국가유산청 공개 Open API에서 국가유산 설명을 조회합니다.
+
+    국가유산청의 목록/상세 XML endpoint는 별도 API key 없이 공개되어 있습니다.
+    운영시간·요금이 아니라 역사·유래·시대·소재지 같은 공식 설명을 보강하는 용도입니다.
+    """
+
+    LIST_URL = "https://www.khs.go.kr/cha/SearchKindOpenapiList.do"
+    DETAIL_URL = "https://www.khs.go.kr/cha/SearchKindOpenapiDt.do"
+
+    async def _get_xml(self, url: str, *, params: dict[str, Any]) -> str:
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "GyeongjuHanjeok/1.0 (official heritage lookup)",
+                },
+            ) as client:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                return response.text
+        except httpx.HTTPStatusError as exc:
+            raise IntegrationError(
+                "korean_heritage",
+                f"HTTP {exc.response.status_code}: {exc.response.text[:300]}",
+                status_code=exc.response.status_code,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise IntegrationError("korean_heritage", str(exc)) from exc
+
+    @staticmethod
+    def _xml_value(item: ET.Element | None, name: str) -> str:
+        if item is None:
+            return ""
+        node = item.find(name)
+        if node is None or node.text is None:
+            return ""
+        return re.sub(r"\s+", " ", node.text).strip()
+
+    @staticmethod
+    def _compact(value: str) -> str:
+        return re.sub(r"[^0-9a-z가-힣]", "", value.lower())
+
+    @classmethod
+    def _candidate_score(cls, item: ET.Element, query: str) -> int:
+        name = cls._xml_value(item, "ccbaMnm1")
+        province = cls._xml_value(item, "ccbaCtcdNm")
+        district = cls._xml_value(item, "ccsiName")
+        compact_query = cls._compact(query)
+        compact_name = cls._compact(name)
+
+        score = 0
+        if compact_name == compact_query:
+            score += 200
+        elif compact_query and compact_query in compact_name:
+            score += 120
+        elif compact_name and compact_name in compact_query:
+            score += 80
+
+        if "경주" in district:
+            score += 40
+        if "경북" in province or "경상북도" in province:
+            score += 20
+        if cls._xml_value(item, "ccbaCncl").upper() == "Y":
+            score -= 500
+        return score
+
+    async def contexts(self, title: str, *, limit: int = 2) -> list[dict[str, Any]]:
+        short_title = title.strip()
+        if short_title.startswith("경주 "):
+            short_title = short_title[3:].strip()
+        if not short_title:
+            return []
+
+        raw = await self._get_xml(
+            self.LIST_URL,
+            params={
+                "ccbaMnm1": short_title,
+                "pageUnit": 20,
+                "pageIndex": 1,
+            },
+        )
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as exc:
+            raise IntegrationError("korean_heritage", f"invalid XML: {exc}") from exc
+
+        candidates = sorted(
+            (
+                (self._candidate_score(item, short_title), item)
+                for item in root.findall(".//item")
+            ),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
+        candidates = [pair for pair in candidates if pair[0] > 0][: max(limit * 2, 4)]
+
+        results: list[dict[str, Any]] = []
+        for _, item in candidates:
+            kind = self._xml_value(item, "ccbaKdcd")
+            number = self._xml_value(item, "ccbaAsno")
+            province_code = self._xml_value(item, "ccbaCtcd")
+            if not (kind and number and province_code):
+                continue
+
+            detail_raw = await self._get_xml(
+                self.DETAIL_URL,
+                params={
+                    "ccbaKdcd": kind,
+                    "ccbaAsno": number,
+                    "ccbaCtcd": province_code,
+                },
+            )
+            try:
+                detail_root = ET.fromstring(detail_raw)
+            except ET.ParseError:
+                continue
+            detail = detail_root.find(".//item")
+            if detail is None:
+                continue
+
+            name = self._xml_value(detail, "ccbaMnm1") or self._xml_value(item, "ccbaMnm1")
+            content = self._xml_value(detail, "content")
+            fields = [
+                ("국가유산 종목", self._xml_value(detail, "ccmaName")),
+                ("시대", self._xml_value(detail, "ccceName")),
+                ("소재지", self._xml_value(detail, "ccbaLcad")),
+                ("관리자", self._xml_value(detail, "ccbaAdmin")),
+            ]
+            prefix = " / ".join(f"{label}: {value}" for label, value in fields if value)
+            overview = "\n".join(part for part in (prefix, content) if part).strip()
+            if not overview:
+                continue
+
+            source_url = (
+                f"{self.DETAIL_URL}?ccbaKdcd={kind}&ccbaAsno={number}&ccbaCtcd={province_code}"
+            )
+            results.append(
+                {
+                    "title": f"국가유산청 - {name}",
+                    "category": "국가유산 공식자료",
+                    "overview": overview[:8000],
+                    "homepage": source_url,
+                    "source_url": source_url,
+                    "source_name": "국가유산청",
+                }
+            )
+            if len(results) >= limit:
+                break
+        return results
+
+
+class DaumSearchClient(BaseClient):
+    """Kakao REST API key를 사용한 Daum 웹문서 검색."""
+
+    BASE_URL = "https://dapi.kakao.com/v2/search/web"
+
+    async def web_documents(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        if not self.settings.kakao_rest_api_key:
+            raise IntegrationError(
+                "daum_search",
+                "KAKAO_REST_API_KEY가 설정되지 않았습니다.",
+                status_code=503,
+            )
+        payload = await self._get(
+            "daum_search",
+            self.BASE_URL,
+            params={
+                "query": query,
+                "sort": "accuracy",
+                "page": 1,
+                "size": max(1, min(int(limit), 50)),
+            },
+            headers={"Authorization": f"KakaoAK {self.settings.kakao_rest_api_key}"},
+        )
+        documents = payload.get("documents")
+        return documents if isinstance(documents, list) else []
+
+
+class TrustedWebSourceClient(BaseClient):
+    """Daum 검색으로 발견한 신뢰 도메인의 원문만 직접 읽습니다.
+
+    검색 스니펫 자체를 정답 근거로 사용하지 않고, 허용된 공공기관/국립기관
+    도메인의 원문을 다시 받아 RAG 컨텍스트로 사용합니다.
+    """
+
+    TRUSTED_DOMAINS: dict[str, str] = {
+        "khs.go.kr": "국가유산청",
+        "heritage.go.kr": "국가유산포털",
+        "nrich.go.kr": "국립문화유산연구원",
+        "museum.go.kr": "국립중앙박물관",
+        "gyeongju.museum.go.kr": "국립경주박물관",
+        "gyeongju.go.kr": "경주시",
+        "visitkorea.or.kr": "대한민국 구석구석",
+    }
+
+    @classmethod
+    def _domain_match(cls, host: str) -> tuple[str, str] | None:
+        host = host.lower().strip(".")
+        for domain, source_name in sorted(
+            cls.TRUSTED_DOMAINS.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            if host == domain or host.endswith("." + domain):
+                return domain, source_name
+        return None
+
+    @classmethod
+    def trusted_source_name(cls, url: str) -> str | None:
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return None
+        if parsed.scheme not in {"http", "https"}:
+            return None
+        match = cls._domain_match(parsed.hostname or "")
+        return match[1] if match else None
+
+    @staticmethod
+    def _tokens(text: str) -> list[str]:
+        stop = {
+            "알려줘", "알려", "어디", "어떤", "무엇", "뭐야", "누구", "경주",
+            "대해", "대한", "정보", "설명", "관광", "관련",
+        }
+        tokens = [token.lower() for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", text)]
+        return list(dict.fromkeys(token for token in tokens if token not in stop))
+
+    @classmethod
+    def _extract_relevant_text(cls, raw_html: str, *, query: str, title: str) -> str:
+        text = re.sub(
+            r"(?is)<(?:script|style|noscript|svg|nav|footer|form)[^>]*>.*?</(?:script|style|noscript|svg|nav|footer|form)>",
+            " ",
+            raw_html,
+        )
+        text = re.sub(
+            r"(?is)<br\s*/?>|</(?:p|div|li|tr|td|th|dd|dt|section|article|h[1-6])>",
+            "\n",
+            text,
+        )
+        text = html.unescape(re.sub(r"(?is)<[^>]+>", " ", text)).replace("\xa0", " ")
+
+        lines: list[str] = []
+        seen: set[str] = set()
+        for raw_line in text.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip(" \t:-·|")
+            if len(line) < 15 or len(line) > 900 or line in seen:
+                continue
+            seen.add(line)
+            lines.append(line)
+
+        if not lines:
+            return ""
+
+        tokens = cls._tokens(f"{title} {query}")
+        title_compact = re.sub(r"[^0-9a-z가-힣]", "", title.lower())
+        scored: list[tuple[int, int, str]] = []
+        for index, line in enumerate(lines):
+            compact = re.sub(r"[^0-9a-z가-힣]", "", line.lower())
+            score = 0
+            if title_compact and title_compact in compact:
+                score += 50
+            for token in tokens:
+                if token in line.lower():
+                    score += min(len(token), 8) * 3
+            scored.append((score, index, line))
+
+        top_indices = {
+            index
+            for score, index, _ in sorted(scored, reverse=True)[:18]
+            if score > 0
+        }
+        if not top_indices:
+            selected = lines[:18]
+        else:
+            expanded = set(top_indices)
+            for index in list(top_indices):
+                if index > 0:
+                    expanded.add(index - 1)
+                if index + 1 < len(lines):
+                    expanded.add(index + 1)
+            selected = [lines[index] for index in sorted(expanded)[:30]]
+
+        return "\n".join(selected)[:8000]
+
+    async def fetch_document(self, url: str, *, query: str, title: str) -> dict[str, Any] | None:
+        source_name = self.trusted_source_name(url)
+        if not source_name:
+            return None
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout,
+                follow_redirects=True,
+                headers={"User-Agent": "GyeongjuHanjeok/1.0 (trusted source RAG)"},
+            ) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                final_url = str(response.url)
+                final_source_name = self.trusted_source_name(final_url)
+                if not final_source_name:
+                    return None
+                content_type = (response.headers.get("content-type") or "").lower()
+                if not any(kind in content_type for kind in ("text/html", "text/plain", "application/xhtml")):
+                    return None
+                overview = self._extract_relevant_text(response.text, query=query, title=title)
+        except (httpx.HTTPError, ValueError):
+            return None
+
+        if not overview:
+            return None
+        return {
+            "title": f"{final_source_name} - {title}",
+            "category": "공식 웹자료",
+            "overview": overview,
+            "homepage": final_url,
+            "source_url": final_url,
+            "source_name": final_source_name,
+        }
+
+
 
 
 class RegionalVisitorClient(BaseClient):
