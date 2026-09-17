@@ -1684,6 +1684,7 @@ class TrustedWebSourceClient(BaseClient):
         "nrich.go.kr": "국립문화유산연구원",
         "museum.go.kr": "국립중앙박물관",
         "gyeongju.museum.go.kr": "국립경주박물관",
+        "encykorea.aks.ac.kr": "한국민족문화대백과사전",
         "gyeongju.go.kr": "경주시",
         "visitkorea.or.kr": "대한민국 구석구석",
     }

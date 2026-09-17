@@ -7708,6 +7708,9 @@ class RagService:
             # 국립박물관 전시 설명처럼 특정 인명을 제시하지 않고
             # '왕(족)의 무덤'으로 분류하는 공식 문장도 직접근거로 인정합니다.
             r"왕\s*\(?족\)?(?:의)?\s*무덤",
+            r"(?:피장자|묘주).{0,50}(?:[가-힣]{2,12}).{0,25}(?:추정|지목)",
+            r"(?:[가-힣]{2,12}).{0,25}(?:피장자|묘주).{0,25}(?:추정|지목)",
+            r"(?:잠정적으로\s*)?[가-힣]{2,12}(?:의)?\s*(?:왕릉|무덤)(?:으로)?\s*추정",
         )
 
         sentences: list[tuple[int, str]] = []
@@ -7742,6 +7745,8 @@ class RagService:
                     score += 35
                 if re.search(r"왕\s*\(?족\)?(?:의)?\s*무덤", sentence):
                     score += 30
+                if any(word in sentence for word in ("추정", "지목", "왕릉")):
+                    score += 25
             elif intent == "builder":
                 if not any(word in sentence for word in ("세웠", "지었", "창건", "건립", "조성", "완공", "완성", "시공")):
                     continue
@@ -7789,6 +7794,7 @@ class RagService:
             "국가유산포털": 40,
             "국립문화유산연구원": 38,
             "국립중앙박물관": 36,
+            "한국민족문화대백과사전": 34,
             "경주시": 30,
             "대한민국 구석구석": 20,
         }.get(source_name, 0)
@@ -7817,9 +7823,11 @@ class RagService:
         answer = " ".join(best)
         if intent == "tomb_owner":
             unknown_markers = ("미상", "알 수 없", "밝혀지지", "확인되지", "명확하지", "전해지지")
-            if not any(marker in answer for marker in unknown_markers) and re.search(
-                r"왕\s*\(?족\)?(?:의)?\s*무덤", answer
-            ):
+            if any(marker in answer for marker in unknown_markers):
+                return answer
+            if "추정" in answer or "지목" in answer or "왕릉" in answer:
+                return "피장자가 확정된 것은 아닙니다. " + answer
+            if re.search(r"왕\s*\(?족\)?(?:의)?\s*무덤", answer):
                 return (
                     "공식 자료에서는 이 무덤을 왕(족)의 무덤으로 소개하고 있으며, "
                     "확인한 자료에는 특정 피장자의 이름이 제시되어 있지 않습니다. " + answer
@@ -7949,14 +7957,18 @@ class RagService:
             add_query(f"{primary} 피장자 국립경주박물관")
             add_query(f"{primary} 피장자 국립문화유산연구원")
             add_query(f"{primary} 피장자 국가유산포털")
+            add_query(f"{primary} 피장자 한국민족문화대백과사전")
+            add_query(f"{primary} 왕릉 추정 한국민족문화대백과사전")
         elif intent == "builder":
             add_query(f"{primary} 누가 세웠 건립 장인 아비지 창건")
             add_query(f"{primary} 건립 주체 경주문화관광")
             add_query(f"{primary} 장인 국가유산포털")
+            add_query(f"{primary} 건립 한국민족문화대백과사전")
         elif intent == "date":
             add_query(f"{primary} 언제 창건 건립 완공 연대")
             add_query(f"{primary} 몇 년 완성 국가유산포털")
             add_query(f"{primary} 창건 국립경주박물관")
+            add_query(f"{primary} 창건 연대 한국민족문화대백과사전")
         elif intent == "artifact":
             add_query(f"{primary} 출토 유물")
         add_query(query)
@@ -7964,6 +7976,7 @@ class RagService:
         add_query(f"{primary} 국가유산포털")
         add_query(f"{primary} 국가유산청")
         add_query(f"{primary} 국립문화유산연구원")
+        add_query(f"{primary} 한국민족문화대백과사전")
 
         async def heritage_lookup(variant: str) -> list[dict]:
             try:
@@ -7984,7 +7997,7 @@ class RagService:
                 return []
 
         # WARNING level is intentional during contest validation: Railway commonly hides INFO logs.
-        trace_queries = search_queries[:10]
+        trace_queries = search_queries[:12]
         logger.warning(
             "RAG-TRACE search start query=%r intent=%s subject=%r variants=%s daum_queries=%s",
             query, intent, primary, variants[:3], trace_queries,
@@ -8008,8 +8021,31 @@ class RagService:
             flush=True,
         )
 
+        # 국립경주박물관 자체 검색 페이지도 보조 신뢰 소스로 직접 조회합니다.
+        # Daum 색인에 박물관 페이지가 빠져도 '왕(족)의 무덤, 천마총' 같은
+        # 공식 박물관 설명을 찾을 수 있게 합니다. 날짜 질문에는 불필요한 지연을
+        # 만들지 않도록 tomb_owner / builder 질문에만 1.5초 제한으로 사용합니다.
+        direct_trusted_contexts: list[dict] = []
+        if intent in {"tomb_owner", "builder"}:
+            try:
+                from urllib.parse import quote_plus
+                museum_search_url = (
+                    "https://gyeongju.museum.go.kr/mecsearch/search.do?field=board&kw="
+                    + quote_plus(primary)
+                )
+                museum_context = await asyncio.wait_for(
+                    self.trusted_web.fetch_document(
+                        museum_search_url, query=query, title=primary
+                    ),
+                    timeout=min(self.RAG_TRUSTED_FETCH_TIMEOUT_SECONDS, 1.5),
+                )
+                if museum_context:
+                    direct_trusted_contexts.append(museum_context)
+            except (IntegrationError, asyncio.TimeoutError, ValueError):
+                pass
+
         # Collect more candidates first.  Do NOT truncate KHS results before Daum evidence is compared.
-        candidates: list[dict] = []
+        candidates: list[dict] = list(direct_trusted_contexts)
         seen_urls: set[str] = set()
         for batch in heritage_batches:
             for context in batch:
@@ -8029,6 +8065,7 @@ class RagService:
             "국가유산포털": 48,
             "국립문화유산연구원": 45,
             "국립중앙박물관": 42,
+            "한국민족문화대백과사전": 40,
             "경주시": 30,
             "대한민국 구석구석": 20,
         }
@@ -8119,6 +8156,14 @@ class RagService:
             ranked.append((score, context))
 
         ranked.sort(key=lambda item: item[0], reverse=True)
+        candidate_preview = [
+            (str(c.get("source_name") or ""), str(c.get("title") or "")[:90])
+            for c in candidates[:12]
+        ]
+        print(
+            f"RAG-TRACE candidates query={query!r} preview={candidate_preview!r}",
+            flush=True,
+        )
         contexts = [context for _, context in ranked[: self.RAG_EXTERNAL_MAX_CONTEXTS]]
         ranked_preview = [(score, c.get("title")) for score, c in ranked[:5]]
         logger.warning(
