@@ -19,7 +19,7 @@ def _session():
     return Session(engine)
 
 
-def test_seokguram_when_uses_local_direct_history_without_external(monkeypatch):
+def test_seokguram_when_uses_local_direct_history_after_external_miss(monkeypatch):
     db = _session()
     db.add(PlaceRecord(
         place_id="sg", title="석굴암 [유네스코 세계유산]", category="관광지",
@@ -36,11 +36,14 @@ def test_seokguram_when_uses_local_direct_history_without_external(monkeypatch):
     db.commit()
     service = RagService(_settings(), db)
 
-    async def fail_external(*args, **kwargs):
-        raise AssertionError("local direct evidence should answer before external API")
-    monkeypatch.setattr(service, "_external_fallback_response", fail_external)
+    calls = []
+    async def miss_external(*args, **kwargs):
+        calls.append(True)
+        return None
+    monkeypatch.setattr(service, "_external_fallback_response", miss_external)
 
     result = asyncio.run(service.search("석굴암은 언제 만들어졌어?", 5))
+    assert calls == [True]
     assert result.grounded is True
     assert "751년" in result.answer
     assert "774년" in result.answer

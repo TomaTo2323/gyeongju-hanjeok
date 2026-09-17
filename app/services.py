@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 import time
@@ -39,6 +40,8 @@ from .db import (
 from .enrichment import PlaceInfoEnricher
 from .geo import haversine_km
 from .optimizer import Individual, optimize_courses
+logger = logging.getLogger(__name__)
+
 from .schemas import (
     ChatTurn,
     ContentItem,
@@ -7194,11 +7197,11 @@ class RagService:
     RAG_TOTAL_BUDGET_SECONDS = 14.0
     RAG_EMBEDDING_TIMEOUT_SECONDS = 2.5
     RAG_INTERNAL_ANSWER_TIMEOUT_SECONDS = 5.0
-    RAG_EXTERNAL_CONTEXT_TIMEOUT_SECONDS = 5.0
-    RAG_EXTERNAL_ANSWER_TIMEOUT_SECONDS = 4.5
-    RAG_HERITAGE_LOOKUP_TIMEOUT_SECONDS = 2.2
-    RAG_DAUM_LOOKUP_TIMEOUT_SECONDS = 2.0
-    RAG_TRUSTED_FETCH_TIMEOUT_SECONDS = 2.2
+    RAG_EXTERNAL_CONTEXT_TIMEOUT_SECONDS = 7.5
+    RAG_EXTERNAL_ANSWER_TIMEOUT_SECONDS = 3.0
+    RAG_HERITAGE_LOOKUP_TIMEOUT_SECONDS = 4.0
+    RAG_DAUM_LOOKUP_TIMEOUT_SECONDS = 3.5
+    RAG_TRUSTED_FETCH_TIMEOUT_SECONDS = 3.5
     RAG_EXTERNAL_CACHE_TTL_SECONDS = 1800.0
     RAG_EXTERNAL_MAX_CONTEXTS = 3
     RAG_INTERNAL_MAX_CONTEXTS = 7
@@ -7843,15 +7846,19 @@ class RagService:
                 search_queries.append(value)
 
         compact_query = re.sub(r"\s+", "", query or "")
+        # 질문 의도 확장 검색어를 먼저 만들고 사용자의 원문 질문도 함께 보냅니다.
+        # 실제 호출은 병렬이므로 검색어 수가 늘어도 지연이 직렬 누적되지 않습니다.
         if "무덤" in compact_query and any(token in compact_query for token in ("누구", "주인", "피장자")):
-            add_query(f"{primary} 피장자 무덤 주인 미상")
+            add_query(f"{primary} 피장자 무덤 주인 밝혀지지 미상")
         elif any(token in compact_query for token in ("누가세웠", "누가지었", "누가만들", "누가창건")):
-            add_query(f"{primary} 누가 세웠 창건 건립 장인")
+            add_query(f"{primary} 건립 주체 장인 시공 창건")
         elif any(token in compact_query for token in ("언제", "몇년", "몇년도", "시대", "창건", "건립", "조성", "완성")):
-            add_query(f"{primary} 창건 건립 완성 연대")
+            add_query(f"{primary} 창건 건립 완공 연대")
+        add_query(query)
+        add_query(f"{primary} 경주문화관광")
+        add_query(f"{primary} 국가유산포털")
         add_query(f"{primary} 국립경주박물관")
         add_query(f"{primary} 국가유산청")
-        add_query(query)
 
         async def daum_lookup(search_query: str) -> list[dict]:
             try:
@@ -7862,10 +7869,21 @@ class RagService:
             except (IntegrationError, asyncio.TimeoutError, ValueError):
                 return []
 
-        # 순차 3+12회 호출 대신, 국가유산청 2개 + Daum 3개를 동시에 조회합니다.
+        # 국가유산청과 Daum을 반드시 병렬 호출합니다. Railway 로그에서 실제 호출 여부와
+        # 결과 개수를 확인할 수 있도록 진단 로그도 남깁니다.
+        logger.info(
+            "RAG external lookup start query=%r subject=%r variants=%s daum_queries=%s",
+            query, primary, variants[:3], search_queries[:6],
+        )
         heritage_batches, daum_batches = await asyncio.gather(
-            asyncio.gather(*(heritage_lookup(v) for v in variants[:2])),
-            asyncio.gather(*(daum_lookup(q) for q in search_queries[:3])),
+            asyncio.gather(*(heritage_lookup(v) for v in variants[:3])),
+            asyncio.gather(*(daum_lookup(q) for q in search_queries[:6])),
+        )
+        logger.info(
+            "RAG external lookup raw results query=%r heritage=%s daum=%s",
+            query,
+            [len(batch) for batch in heritage_batches],
+            [len(batch) for batch in daum_batches],
         )
 
         for batch in heritage_batches:
@@ -7967,6 +7985,7 @@ class RagService:
                 if len(contexts) >= self.RAG_EXTERNAL_MAX_CONTEXTS:
                     break
 
+        before_filter = len(contexts)
         contexts = [
             context
             for context in contexts
@@ -7974,6 +7993,10 @@ class RagService:
             and self._context_directly_answers_query(query, context)
         ]
         contexts = self._compact_external_contexts(contexts)
+        logger.info(
+            "RAG external lookup filtered query=%r before=%d direct=%d titles=%s",
+            query, before_filter, len(contexts), [c.get("title") for c in contexts],
+        )
         # 실패/빈 결과는 캐시하지 않습니다. 일시적인 국가유산청/Daum 지연이
         # 30분 동안 고착되어 이후 정상 요청까지 막는 현상을 방지합니다.
         if contexts:
@@ -8092,15 +8115,16 @@ class RagService:
         is_heritage_fact = self._is_heritage_fact_query(query)
         external_context_task: asyncio.Task | None = None
         if is_heritage_fact:
-            # 1) sync 때 이미 저장된 검증 역사자료에서 직접 답할 수 있으면 즉시 반환합니다.
-            #    석굴암/황룡사지 같은 대표 유산은 네트워크 왕복 없이 수백 ms 수준으로 처리됩니다.
+            # 문화유산 사실 질문은 국가유산청/Daum 공식검색을 *항상* 시도합니다.
+            # 로컬 DB는 외부 공식검색이 실패했을 때만 보조 fallback으로 사용합니다.
             local_heritage = self._local_heritage_response(query, exact_place)
-            if local_heritage is not None:
-                return local_heritage
-
-            # 2) 로컬에 직접 근거가 없을 때만 국가유산청 -> Daum 신뢰원문 fallback을 사용합니다.
             remaining = self._remaining_rag_budget(request_started)
-            primary_budget = min(8.5, max(0.8, remaining))
+            primary_budget = min(10.5, max(1.0, remaining))
+            logger.info(
+                "RAG heritage branch query=%r exact_place=%r local_grounded=%s budget=%.2f",
+                query, exact_place.title if exact_place is not None else None,
+                local_heritage is not None, primary_budget,
+            )
             try:
                 external = await asyncio.wait_for(
                     self._external_fallback_response(
@@ -8111,11 +8135,17 @@ class RagService:
                     ),
                     timeout=primary_budget,
                 )
-            except (asyncio.TimeoutError, IntegrationError, ValueError):
+            except (asyncio.TimeoutError, IntegrationError, ValueError) as exc:
+                logger.warning("RAG external fallback failed query=%r error=%s", query, exc)
                 external = None
 
+            # 질문에 직접 답하는 외부 공식근거가 있으면 로컬 DB보다 항상 우선합니다.
             if external is not None and external.grounded and external.hits:
                 return external
+
+            # 외부 API가 일시적으로 실패했을 때만 검증 로컬 자료를 사용합니다.
+            if local_heritage is not None:
+                return local_heritage
 
             return RagSearchResponse(
                 query=query,
