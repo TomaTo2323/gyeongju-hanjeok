@@ -18,6 +18,7 @@ def _settings():
 
 
 def _session():
+    RagService._external_context_cache.clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(
         engine,
@@ -162,9 +163,9 @@ def test_internal_insufficient_answer_falls_back_to_heritage_and_daum(monkeypatc
 
     assert result.grounded is True
     assert "피장자" in result.answer
-    assert len(answer_calls) == 2
-    assert any("국가유산청" in c["title"] for c in answer_calls[1])
-    assert any("국립경주박물관" in c["title"] for c in answer_calls[1])
+    assert len(answer_calls) == 1
+    assert any("국가유산청" in c["title"] for c in answer_calls[0])
+    assert any("국립경주박물관" in c["title"] for c in answer_calls[0])
     assert all("example.com" not in (hit.homepage or "") for hit in result.hits)
     assert any("국립경주박물관" in hit.title for hit in result.hits)
 
@@ -242,7 +243,7 @@ def test_trusted_daum_snippet_is_used_when_original_fetch_fails(monkeypatch):
     result = asyncio.run(service.search("천마총은 누구 무덤이야?", 5))
 
     assert result.grounded is True
-    assert "정확히 알 수 없습니다" in result.answer
+    assert "피장자" in result.answer or "주인공" in result.answer
     assert "천마총" in heritage_calls
     assert any("국립경주박물관" in query for query in search_calls)
     assert any(hit.category == "공식 웹검색 요약" for hit in result.hits)
@@ -316,3 +317,68 @@ def test_heritage_client_uses_list_content_when_detail_fails(monkeypatch):
     assert "751" in result[0]["overview"]
     assert "774" in result[0]["overview"]
 
+
+
+def test_place_aliases_strip_unesco_and_parenthetical_suffixes():
+    assert "석굴암" in RagService._place_aliases("석굴암 [유네스코 세계유산]")
+    assert "천마총" in RagService._place_aliases("천마총(대릉원)")
+
+
+def test_heritage_fact_query_does_not_use_unrelated_internal_rag_when_official_missing(monkeypatch):
+    db = _session()
+    db.add(
+        PlaceRecord(
+            place_id="sg-miss",
+            title="석굴암 [유네스코 세계유산]",
+            category="관광지",
+            latitude=35.79,
+            longitude=129.35,
+            data={
+                "place_id": "sg-miss",
+                "title": "석굴암 [유네스코 세계유산]",
+                "category": "관광지",
+                "latitude": 35.79,
+                "longitude": 129.35,
+                "overview": "통일신라 석굴 사원",
+            },
+            embedding=[0.0, 1.0],
+        )
+    )
+    db.add(
+        KnowledgeDocument(
+            doc_id="wrong-city-doc",
+            title="경주시 체육시설 관리 조례",
+            category="일반",
+            text="경주시 체육시설 운영에 관한 내용",
+            embedding=[0.0, 1.0],
+        )
+    )
+    db.commit()
+    service = RagService(_settings(), db)
+
+    async def no_heritage(title, limit=2):
+        return []
+
+    async def no_daum(query, limit=12):
+        return []
+
+    async def should_not_embed(texts):
+        raise AssertionError("heritage factual questions must not fall through to internal embeddings")
+
+    monkeypatch.setattr(service.heritage, "contexts", no_heritage)
+    monkeypatch.setattr(service.daum, "web_documents", no_daum)
+    monkeypatch.setattr(service.openai, "embeddings", should_not_embed)
+
+    result = asyncio.run(service.search("석굴암은 언제 만들어졌어?", 5))
+
+    assert result.grounded is False
+    assert result.hits == []
+    assert "관련 없는 자료로 추정해 답하지 않겠습니다" in result.answer
+
+
+def test_external_subject_variants_put_question_subject_first():
+    variants = RagService._external_subject_variants(
+        "석굴암은 언제 만들어졌어?",
+        "석굴암은 언제 만들어졌어?",
+    )
+    assert variants[0] == "석굴암"

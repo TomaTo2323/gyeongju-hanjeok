@@ -7223,12 +7223,24 @@ class RagService:
 
     @classmethod
     def _place_aliases(cls, title: str) -> list[str]:
-        normalized = normalize_name(title)
-        aliases = [normalized] if normalized else []
+        # TourAPI 제목에는 "석굴암 [유네스코 세계유산]", "천마총(대릉원)"처럼
+        # 보조 설명/상위 장소가 붙는 경우가 있습니다. 전체 제목만 alias로 쓰면
+        # 사용자의 자연스러운 질문("석굴암은 언제...")에서 정확 장소를 놓칩니다.
+        raw_variants = [
+            title or "",
+            re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}", " ", title or ""),
+            re.split(r"[\(\[\{]", title or "", maxsplit=1)[0],
+        ]
 
+        aliases: list[str] = []
         gyeongju = normalize_name("경주")
-        if normalized.startswith(gyeongju) and len(normalized) >= len(gyeongju) + 2:
-            aliases.append(normalized[len(gyeongju):])
+        for raw in raw_variants:
+            normalized = normalize_name(raw)
+            if not normalized:
+                continue
+            aliases.append(normalized)
+            if normalized.startswith(gyeongju) and len(normalized) >= len(gyeongju) + 2:
+                aliases.append(normalized[len(gyeongju):])
 
         return list(
             dict.fromkeys(
@@ -7555,21 +7567,22 @@ class RagService:
             if len(value) >= 2 and value not in variants:
                 variants.append(value)
 
-        add(subject)
-        add(re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}", " ", subject))
-
-        # 괄호 안 명칭도 별도 후보로 둡니다. 예: 천마총(대릉원) -> 대릉원
-        for inner in re.findall(r"\(([^)]+)\)|\[([^]]+)\]|\{([^}]+)\}", subject):
-            add(next((part for part in inner if part), ""))
-
-        # 질문의 앞부분에서 장소/유산명으로 보이는 구절을 추출합니다.
-        # 예: "천마총은 누구 무덤이야?" -> "천마총"
+        # 질문에 직접 쓰인 주어를 가장 먼저 둡니다. exact_place를 못 찾았을 때
+        # subject가 질문 전체가 되더라도 "석굴암은 언제..." 대신 "석굴암"으로
+        # 국가유산청/Daum 검색을 시작하도록 합니다.
         question_match = re.match(
-            r"^\s*(.+?)(?:은|는|이|가|을|를|의|에서|에는|에)?\s*(?:누구|언제|왜|어디|무엇|뭐|어떤|몇|어떻게)",
+            r"^\s*(.+?)(?:은|는|이|가|을|를|의|에서|에는|에)\s*(?:누구|누가|언제|왜|어디|무엇|뭐|어떤|몇|어떻게)",
             query or "",
         )
         if question_match:
             add(question_match.group(1))
+
+        add(re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}", " ", subject))
+        add(subject)
+
+        # 괄호 안 명칭도 별도 후보로 둡니다. 예: 천마총(대릉원) -> 대릉원
+        for inner in re.findall(r"\(([^)]+)\)|\[([^]]+)\]|\{([^}]+)\}", subject):
+            add(next((part for part in inner if part), ""))
 
         # 토큰 단위 후보는 너무 일반적인 말은 제외합니다.
         stop = {
@@ -7585,6 +7598,23 @@ class RagService:
                     add(token)
 
         return variants[:6]
+
+    @classmethod
+    def _context_matches_subject(
+        cls,
+        query: str,
+        exact_place: PlaceRecord | None,
+        context: dict,
+    ) -> bool:
+        subject = exact_place.title if exact_place is not None else query
+        variants = cls._external_subject_variants(subject, query)
+        subject_keys = [normalize_name(v) for v in variants[:4] if len(normalize_name(v)) >= 2]
+        if not subject_keys:
+            return False
+        searchable = normalize_name(
+            f"{context.get('title', '')} {context.get('overview', '')}"
+        )
+        return any(key in searchable for key in subject_keys)
 
     @staticmethod
     def _trusted_search_snippet_context(document: dict, source_name: str) -> dict | None:
@@ -7614,36 +7644,57 @@ class RagService:
         tokens = (
             "누구", "누가", "무덤", "피장자", "주인", "언제", "몇년", "몇년도",
             "만들", "세웠", "건립", "창건", "조성", "완성", "시대", "유물", "출토",
-            "국보", "보물", "문화재", "역사", "원래이름", "왜지었", "왜만들",
+            "국보", "보물", "문화재", "원래이름", "왜지었", "왜만들",
         )
         return any(token in compact for token in tokens)
 
-    @staticmethod
-    def _extractive_context_answer(query: str, contexts: list[dict]) -> str:
-        """LLM이 시간 예산을 넘긴 경우 공식자료 문장만 골라 즉시 반환합니다."""
+    @classmethod
+    def _extractive_context_answer(cls, query: str, contexts: list[dict]) -> str:
+        """LLM이 시간 예산을 넘긴 경우에도 질문 대상/의도와 맞는 공식문장만 반환합니다."""
+        variants = cls._external_subject_variants(query, query)
+        subject_keys = [normalize_name(v) for v in variants[:3] if len(normalize_name(v)) >= 2]
         query_tokens = [
             token.lower()
             for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query or "")
             if token not in {"알려줘", "알려", "누구", "누가", "언제", "어디", "뭐야", "무엇"}
         ]
+        compact_query = re.sub(r"\s+", "", query or "")
+        wants_when = any(token in compact_query for token in ("언제", "몇년", "몇년도", "시대", "만들", "창건", "건립", "완성", "조성"))
+        wants_who = any(token in compact_query for token in ("누구", "누가", "피장자", "주인", "무덤"))
+
         candidates: list[tuple[int, int, str]] = []
         seen: set[str] = set()
         for context in contexts[:3]:
+            context_title = normalize_name(str(context.get("title") or ""))
+            title_matches = any(key in context_title for key in subject_keys) if subject_keys else False
             raw = str(context.get("overview") or "")
             for sentence in re.split(r"[.!?。]\s+|다\.\s+|[\n\r]+", raw):
                 sentence = re.sub(r"\s+", " ", sentence).strip(" -·")
                 if len(sentence) < 15 or len(sentence) > 380 or sentence in seen:
                     continue
+                sentence_key = normalize_name(sentence)
+                subject_match = any(key in sentence_key for key in subject_keys) if subject_keys else False
+                if not (title_matches or subject_match):
+                    continue
+                if wants_when and not (
+                    re.search(r"(?:\d{3,4}년|\d{1,2}세기)", sentence)
+                    or any(word in sentence for word in ("창건", "건립", "완성", "조성", "시대", "경덕왕", "혜공왕"))
+                ):
+                    continue
+                if wants_who and not any(
+                    word in sentence for word in ("피장자", "주인", "누구", "왕", "왕비", "김대성", "무덤", "묘")
+                ):
+                    continue
                 seen.add(sentence)
                 lowered = sentence.lower()
-                score = sum(5 for token in query_tokens if token in lowered)
+                score = (10 if subject_match else 5) + sum(5 for token in query_tokens if token in lowered)
                 if re.search(r"(?:\d{3,4}년|\d{1,2}세기)", sentence):
-                    score += 3
+                    score += 5
                 if any(word in sentence for word in ("창건", "건립", "완성", "조성", "피장자", "출토", "무덤")):
-                    score += 2
+                    score += 3
                 candidates.append((score, -len(sentence), sentence))
         if not candidates:
-            return "공식 자료를 찾았지만 답변 생성이 지연되고 있습니다. 참고한 공식 자료를 확인해 주세요."
+            return "공식 자료를 찾았지만 질문에 직접 답하는 근거를 확인하지 못했습니다."
         return " ".join(item[2] for item in sorted(candidates, reverse=True)[:2])
 
     @classmethod
@@ -7832,8 +7883,19 @@ class RagService:
                 if len(contexts) >= self.RAG_EXTERNAL_MAX_CONTEXTS:
                     break
 
+        contexts = [
+            context
+            for context in contexts
+            if self._context_matches_subject(query, exact_place, context)
+        ]
         contexts = self._compact_external_contexts(contexts)
-        self._external_context_cache[cache_key] = (time.monotonic(), [dict(item) for item in contexts])
+        # 실패/빈 결과는 캐시하지 않습니다. 일시적인 국가유산청/Daum 지연이
+        # 30분 동안 고착되어 이후 정상 요청까지 막는 현상을 방지합니다.
+        if contexts:
+            self._external_context_cache[cache_key] = (
+                time.monotonic(),
+                [dict(item) for item in contexts],
+            )
         return contexts
 
     async def _external_fallback_response(
@@ -7850,7 +7912,11 @@ class RagService:
             self.RAG_TOTAL_BUDGET_SECONDS,
         )
         started = time.monotonic()
-        contexts = self._compact_external_contexts(prefetched_contexts or [])
+        contexts = [
+            context
+            for context in self._compact_external_contexts(prefetched_contexts or [])
+            if self._context_matches_subject(query, exact_place, context)
+        ]
         if not contexts:
             context_timeout = min(self.RAG_EXTERNAL_CONTEXT_TIMEOUT_SECONDS, max(0.5, budget - 1.0))
             try:
@@ -7924,12 +7990,40 @@ class RagService:
                 grounded=grounded,
             )
 
-        # 역사/문화유산 질문은 내부 RAG와 동시에 외부 공식자료를 미리 찾습니다.
-        # 내부 답이 충분하면 이 결과는 버리고, 부족할 때만 즉시 재사용합니다.
+        # 역사/문화유산의 사실 질문은 일반 내부 RAG보다 공식자료를 우선합니다.
+        # 내부 KnowledgeDocument에는 예절/접근성 등 다른 주제 문서가 많아,
+        # "석굴암은 언제 만들어졌어?" 같은 질문에 엉뚱한 고득점 문서가 섞일 수 있습니다.
+        # 이런 질문은 국가유산청/국립박물관/경주시 등 신뢰 자료에서만 답하고,
+        # 공식자료가 없으면 관련 없는 내부 문서로 억지 답변하지 않습니다.
+        is_heritage_fact = self._is_heritage_fact_query(query)
         external_context_task: asyncio.Task | None = None
-        if self._is_heritage_fact_query(query):
-            external_context_task = asyncio.create_task(
-                self._external_official_contexts(query, exact_place)
+        if is_heritage_fact:
+            remaining = self._remaining_rag_budget(request_started)
+            primary_budget = min(9.5, max(0.8, remaining))
+            try:
+                external = await asyncio.wait_for(
+                    self._external_fallback_response(
+                        query,
+                        history,
+                        exact_place,
+                        budget_seconds=primary_budget,
+                    ),
+                    timeout=primary_budget,
+                )
+            except (asyncio.TimeoutError, IntegrationError, ValueError):
+                external = None
+
+            if external is not None and external.grounded and external.hits:
+                return external
+
+            return RagSearchResponse(
+                query=query,
+                answer=(
+                    "질문과 직접 관련된 공식 문화유산 자료를 확인하지 못했습니다. "
+                    "관련 없는 자료로 추정해 답하지 않겠습니다."
+                ),
+                hits=external.hits if external is not None else [],
+                grounded=False,
             )
 
         try:

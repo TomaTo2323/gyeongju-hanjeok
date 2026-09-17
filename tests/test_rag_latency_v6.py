@@ -14,6 +14,7 @@ def _settings():
 
 
 def _session():
+    RagService._external_context_cache.clear()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine, tables=[PlaceRecord.__table__, KnowledgeDocument.__table__])
     return Session(engine)
@@ -60,7 +61,7 @@ def test_external_searches_are_parallel_and_limited(monkeypatch):
     assert len(contexts) <= 3
 
 
-def test_history_question_prefetches_external_while_internal_answer_runs(monkeypatch):
+def test_history_fact_question_uses_official_path_before_internal_rag(monkeypatch):
     db = _session()
     db.add(PlaceRecord(
         place_id="sg-1",
@@ -83,15 +84,12 @@ def test_history_question_prefetches_external_while_internal_answer_runs(monkeyp
     answer_calls = 0
 
     async def embeddings(texts):
-        await asyncio.sleep(0.05)
-        return [[0.0, 1.0]]
+        raise AssertionError("official heritage path should answer before internal embedding")
 
     async def answer(query, contexts, history=None):
         nonlocal answer_calls
         answer_calls += 1
         await asyncio.sleep(0.15)
-        if answer_calls == 1:
-            return "확인할 수 있는 자료가 부족합니다."
         return "국가유산청 자료에 따르면 석굴암은 751년에 창건을 시작해 774년에 완성되었습니다."
 
     async def heritage(title, limit=2):
@@ -120,5 +118,5 @@ def test_history_question_prefetches_external_while_internal_answer_runs(monkeyp
 
     assert result.grounded is True
     assert "751년" in result.answer
-    assert answer_calls == 2
+    assert answer_calls == 1
     assert elapsed < 0.8
