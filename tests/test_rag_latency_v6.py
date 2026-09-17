@@ -118,5 +118,6 @@ def test_history_fact_question_uses_official_path_before_internal_rag(monkeypatc
 
     assert result.grounded is True
     assert "751년" in result.answer
-    assert answer_calls == 1
+    # V8: 직접근거가 있으면 LLM 호출 없이 즉시 답합니다.
+    assert answer_calls == 0
     assert elapsed < 0.8

@@ -163,9 +163,8 @@ def test_internal_insufficient_answer_falls_back_to_heritage_and_daum(monkeypatc
 
     assert result.grounded is True
     assert "피장자" in result.answer
-    assert len(answer_calls) == 1
-    assert any("국가유산청" in c["title"] for c in answer_calls[0])
-    assert any("국립경주박물관" in c["title"] for c in answer_calls[0])
+    # V8: 공식문서에서 직접근거를 추출할 수 있으면 LLM을 호출하지 않습니다.
+    assert len(answer_calls) == 0
     assert all("example.com" not in (hit.homepage or "") for hit in result.hits)
     assert any("국립경주박물관" in hit.title for hit in result.hits)
 
