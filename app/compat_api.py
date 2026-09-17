@@ -6,6 +6,7 @@ import asyncio
 import random
 import time
 import re
+import html
 import secrets
 from typing import Any
 from urllib.parse import urlparse
@@ -16,12 +17,15 @@ from sqlalchemy.orm import Session
 
 from .clients import (
     CongestionClient,
+    DaumSearchClient,
+    GyeongjuOfficialTourClient,
     IntegrationError,
     KakaoLocalClient,
     NaverClient,
     OpenAIClient,
     RegionalVisitorClient,
     TourApiClient,
+    TrustedWebSourceClient,
     WeatherClient,
     normalize_name,
 )
@@ -2840,6 +2844,292 @@ async def _load_place_detail_core(
     return place
 
 
+
+
+def _place_detail_facts_from_official_text(
+    title: str,
+    raw_text: str,
+) -> dict[str, str]:
+    """경주시/대한민국 구석구석 원문에서 방문정보만 보수적으로 추출합니다.
+
+    명시되지 않은 값은 만들지 않습니다.
+    """
+    text = html.unescape(raw_text or "").replace("\xa0", " ")
+    text = re.sub(r"\r\n?", "\n", text)
+    lines = [
+        re.sub(r"\s+", " ", line).strip(" \t:-·|")
+        for line in text.splitlines()
+    ]
+    lines = [line for line in lines if line]
+    clean = " \n ".join(lines)
+
+    result: dict[str, str] = {}
+
+    next_labels = (
+        "주소|위치|이용시간|운영시간|관람시간|개방시간|영업시간|"
+        "휴무일|휴관일|쉬는날|쉬는 날|이용료|입장료|관람료|요금|"
+        "주차정보|주차 안내|주차안내|주차|편의시설|전화|문의전화|문의처|문의"
+    )
+
+    def extract(*labels: str, max_len: int = 260) -> str | None:
+        joined = "|".join(re.escape(label) for label in labels)
+        match = re.search(
+            rf"(?:{joined})\s*[:：]?\s*(.+?)(?=\s*(?:-|·|\|)?\s*(?:{next_labels})\s*[:：]|\n|$)",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        value = re.sub(r"\s+", " ", match.group(1)).strip(" -·|,;")
+        if not value:
+            return None
+        return value[:max_len]
+
+    hours = extract("이용시간", "운영시간", "관람시간", "개방시간", "영업시간")
+    if hours:
+        result["operating_hours"] = hours
+
+    rest = extract("휴무일", "휴관일", "쉬는날", "쉬는 날")
+    if rest:
+        result["rest_date"] = rest
+    elif "연중무휴" in clean:
+        result["rest_date"] = "연중무휴"
+
+    fee = extract("이용료", "입장료", "관람료", "요금")
+    if fee:
+        result["fee_text"] = fee
+    elif re.search(r"(?:무료이용|무료 이용|이용료\s*[:：]?\s*무료|입장료\s*[:：]?\s*무료)", clean):
+        result["fee_text"] = "무료"
+
+    parking = extract("주차정보", "주차 안내", "주차안내", "주차")
+    if not parking:
+        facilities = extract("편의시설")
+        if facilities and "주차" in facilities:
+            parking = facilities
+    if parking:
+        result["parking"] = parking
+    elif "무료 주차장" in clean:
+        result["parking"] = "무료 주차장 이용"
+    elif "주차장" in clean:
+        # 원문에 주차장이 있다는 사실만 분명할 때 최소 표현만 사용합니다.
+        result["parking"] = "주차장 이용 가능"
+
+    tel_area = extract("전화", "문의전화", "문의처", "문의") or clean
+    phone_match = re.search(r"(?:0\d{1,2})[-\s)]?\d{3,4}[-\s]?\d{4}", tel_area)
+    if phone_match:
+        result["tel"] = re.sub(r"\s+", "-", phone_match.group(0))
+
+    normalized_title = normalize_name(title)
+    description_parts: list[str] = []
+    for line in lines:
+        compact = normalize_name(line)
+        if len(line) < 30 or len(line) > 700:
+            continue
+        if normalized_title and normalized_title not in compact:
+            continue
+        # 라벨 나열 문구는 장소소개에서 제외합니다.
+        if sum(label in line for label in ("주소", "이용시간", "운영시간", "이용료", "주차정보", "편의시설")) >= 2:
+            continue
+        description_parts.append(line)
+        if len(" ".join(description_parts)) >= 260:
+            break
+
+    if description_parts:
+        result["overview"] = " ".join(description_parts)[:600]
+
+    return result
+
+
+async def _enrich_place_detail_from_official_sources(
+    place: Place,
+    settings: Settings,
+) -> Place:
+    """full 상세 단계에서 빈 필드만 신뢰 가능한 공식 원문으로 보완합니다.
+
+    검색 스니펫을 그대로 값으로 쓰지 않고, Daum 검색으로 경주시/대한민국
+    구석구석 등 허용 도메인 URL을 찾은 뒤 실제 원문을 다시 읽습니다.
+    """
+    title = (place.title or "").strip()
+    if not title or title.isdigit():
+        return place
+
+    result = place.model_copy(deep=True)
+
+    # 1) 이미 RAG에서 검증해 쓰는 경주시 공식 관광정보 클라이언트를 재사용합니다.
+    requested_fields: set[str] = set()
+    if not result.operating_hours:
+        requested_fields.add("operating_hours")
+    if not result.rest_date:
+        requested_fields.add("rest_date")
+    if not result.fee_text:
+        requested_fields.add("fee_text")
+    if not result.parking:
+        requested_fields.add("parking")
+    if not result.tel:
+        requested_fields.add("tel")
+
+    official_url: str | None = None
+    if requested_fields:
+        try:
+            official = await asyncio.wait_for(
+                GyeongjuOfficialTourClient(settings).place_info(title, requested_fields),
+                timeout=4.5,
+            )
+        except (asyncio.TimeoutError, IntegrationError, Exception):
+            official = {}
+
+        if official:
+            official_url = str(official.get("source_url") or "").strip() or None
+            if not result.operating_hours and official.get("operating_hours"):
+                result.operating_hours = str(official["operating_hours"])
+                result.operating_hours_source = "official_web"
+            if not result.rest_date and official.get("rest_date"):
+                result.rest_date = str(official["rest_date"])
+                result.rest_date_source = "official_web"
+            if not result.fee_text and official.get("fee_text"):
+                result.fee_text = str(official["fee_text"])
+                result.fee_source = "official_web"
+            if not result.parking and official.get("parking"):
+                result.parking = str(official["parking"])
+                result.parking_source = "official_web"
+            if not result.tel and official.get("tel"):
+                result.tel = str(official["tel"])
+            if not result.homepage and official_url:
+                result.homepage = official_url
+
+    # 2) 소개 또는 방문정보가 아직 비면 Daum으로 신뢰 원문을 찾아 직접 읽습니다.
+    still_missing = any(
+        not value
+        for value in (
+            result.overview,
+            result.operating_hours,
+            result.rest_date,
+            result.fee_text,
+            result.parking,
+        )
+    )
+    if not still_missing:
+        return result
+
+    daum = DaumSearchClient(settings)
+    trusted = TrustedWebSourceClient(settings)
+    queries = (
+        f"{title} 경주문화관광",
+        f"{title} 대한민국 구석구석",
+        f"{title} 이용시간 이용료 주차 경주",
+    )
+
+    async def search_one(query: str) -> list[dict[str, Any]]:
+        try:
+            return await asyncio.wait_for(daum.web_documents(query, limit=10), timeout=3.0)
+        except (asyncio.TimeoutError, IntegrationError, Exception):
+            return []
+
+    rows = await asyncio.gather(*(search_one(query) for query in queries))
+    normalized_title = normalize_name(title)
+    candidates: list[tuple[int, str, str]] = []
+    seen: set[str] = set()
+    priority = {"경주시": 100, "대한민국 구석구석": 95}
+
+    for batch in rows:
+        for doc in batch:
+            url = str(doc.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            source_name = trusted.trusted_source_name(url)
+            if source_name not in priority:
+                continue
+            searchable = re.sub(
+                r"<[^>]+>",
+                " ",
+                f"{doc.get('title') or ''} {doc.get('contents') or ''}",
+            )
+            score = priority[source_name]
+            if normalized_title and normalized_title in normalize_name(searchable):
+                score += 100
+            candidates.append((score, url, source_name))
+            seen.add(url)
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    if official_url and official_url not in seen and trusted.trusted_source_name(official_url):
+        candidates.insert(0, (250, official_url, trusted.trusted_source_name(official_url) or "경주시"))
+
+    async def fetch_one(item: tuple[int, str, str]):
+        _, url, source_name = item
+        try:
+            context = await asyncio.wait_for(
+                trusted.fetch_document(
+                    url,
+                    query=f"{title} 장소 소개 이용시간 휴무일 이용료 주차 전화",
+                    title=title,
+                ),
+                timeout=4.0,
+            )
+            return context, source_name
+        except (asyncio.TimeoutError, IntegrationError, Exception):
+            return None, source_name
+
+    fetched = await asyncio.gather(*(fetch_one(item) for item in candidates[:5])) if candidates else []
+
+    used_sources: list[str] = []
+    for context, source_name in fetched:
+        if not context:
+            continue
+        raw = str(context.get("overview") or "").strip()
+        if not raw:
+            continue
+        if normalized_title and normalized_title not in normalize_name(raw):
+            continue
+
+        facts = _place_detail_facts_from_official_text(title, raw)
+        if not facts:
+            continue
+
+        if not result.overview and facts.get("overview"):
+            result.overview = facts["overview"]
+            result.overview_source = "official_web"
+        if not result.operating_hours and facts.get("operating_hours"):
+            result.operating_hours = facts["operating_hours"]
+            result.operating_hours_source = "official_web"
+        if not result.rest_date and facts.get("rest_date"):
+            result.rest_date = facts["rest_date"]
+            result.rest_date_source = "official_web"
+        if not result.fee_text and facts.get("fee_text"):
+            result.fee_text = facts["fee_text"]
+            result.fee_source = "official_web"
+        if not result.parking and facts.get("parking"):
+            result.parking = facts["parking"]
+            result.parking_source = "official_web"
+        if not result.tel and facts.get("tel"):
+            result.tel = facts["tel"]
+        if not result.homepage:
+            result.homepage = str(context.get("source_url") or context.get("homepage") or "").strip() or None
+
+        used_sources.append(source_name)
+        if all((result.overview, result.operating_hours, result.fee_text, result.parking)):
+            break
+
+    if used_sources:
+        result.info_sources = list(dict.fromkeys([*result.info_sources, "official_web", *used_sources]))
+        if result.info_confidence in {None, "unknown"}:
+            result.info_confidence = "medium"
+            result.info_confidence_label = "공식 웹자료 확인"
+
+    print(
+        "[PLACE DETAIL OFFICIAL FALLBACK]",
+        f"title={title!r}",
+        f"overview={bool(result.overview)}",
+        f"hours={bool(result.operating_hours)}",
+        f"rest={bool(result.rest_date)}",
+        f"fee={bool(result.fee_text)}",
+        f"parking={bool(result.parking)}",
+        f"phone={bool(result.tel)}",
+        flush=True,
+    )
+
+    return result
+
 async def _load_place_detail_full(
     *,
     core: Place,
@@ -3001,6 +3291,13 @@ async def _load_place_detail_full(
             ):
                 result.info_confidence = "medium"
                 result.info_confidence_label = "공식·보조 정보"
+
+    # 기존 core/full 파이프라인은 그대로 유지하고, full 단계의 빈 필드만
+    # 경주시/대한민국 구석구석 공식 원문으로 보완합니다.
+    result = await _enrich_place_detail_from_official_sources(
+        result,
+        settings,
+    )
 
     blogs, videos, _ = contents
 
