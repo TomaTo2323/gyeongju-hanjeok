@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import math
 import re
 import time
@@ -40,8 +39,6 @@ from .db import (
 from .enrichment import PlaceInfoEnricher
 from .geo import haversine_km
 from .optimizer import Individual, optimize_courses
-logger = logging.getLogger(__name__)
-
 from .schemas import (
     ChatTurn,
     ContentItem,
@@ -7193,23 +7190,6 @@ class RagService:
 
     _GENERIC_ALIASES = {"경주", "관광", "여행"}
 
-    # 챗봇 응답 SLA: 외부 fallback까지 포함해 15초 이내를 목표로 합니다.
-    RAG_TOTAL_BUDGET_SECONDS = 14.0
-    RAG_EMBEDDING_TIMEOUT_SECONDS = 2.5
-    RAG_INTERNAL_ANSWER_TIMEOUT_SECONDS = 5.0
-    RAG_EXTERNAL_CONTEXT_TIMEOUT_SECONDS = 7.5
-    RAG_EXTERNAL_ANSWER_TIMEOUT_SECONDS = 3.0
-    RAG_HERITAGE_LOOKUP_TIMEOUT_SECONDS = 4.0
-    RAG_DAUM_LOOKUP_TIMEOUT_SECONDS = 3.5
-    RAG_TRUSTED_FETCH_TIMEOUT_SECONDS = 3.5
-    RAG_EXTERNAL_CACHE_TTL_SECONDS = 1800.0
-    RAG_EXTERNAL_MAX_CONTEXTS = 3
-    RAG_INTERNAL_MAX_CONTEXTS = 7
-
-    # Railway 1 replica 프로세스 메모리 캐시. 같은 질문/장소의 반복 검색은
-    # 30분간 외부 네트워크 호출 없이 재사용합니다.
-    _external_context_cache: dict[str, tuple[float, list[dict]]] = {}
-
     def __init__(
         self,
         settings: Settings,
@@ -7226,24 +7206,12 @@ class RagService:
 
     @classmethod
     def _place_aliases(cls, title: str) -> list[str]:
-        # TourAPI 제목에는 "석굴암 [유네스코 세계유산]", "천마총(대릉원)"처럼
-        # 보조 설명/상위 장소가 붙는 경우가 있습니다. 전체 제목만 alias로 쓰면
-        # 사용자의 자연스러운 질문("석굴암은 언제...")에서 정확 장소를 놓칩니다.
-        raw_variants = [
-            title or "",
-            re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}", " ", title or ""),
-            re.split(r"[\(\[\{]", title or "", maxsplit=1)[0],
-        ]
+        normalized = normalize_name(title)
+        aliases = [normalized] if normalized else []
 
-        aliases: list[str] = []
         gyeongju = normalize_name("경주")
-        for raw in raw_variants:
-            normalized = normalize_name(raw)
-            if not normalized:
-                continue
-            aliases.append(normalized)
-            if normalized.startswith(gyeongju) and len(normalized) >= len(gyeongju) + 2:
-                aliases.append(normalized[len(gyeongju):])
+        if normalized.startswith(gyeongju) and len(normalized) >= len(gyeongju) + 2:
+            aliases.append(normalized[len(gyeongju):])
 
         return list(
             dict.fromkeys(
@@ -7570,22 +7538,21 @@ class RagService:
             if len(value) >= 2 and value not in variants:
                 variants.append(value)
 
-        # 질문에 직접 쓰인 주어를 가장 먼저 둡니다. exact_place를 못 찾았을 때
-        # subject가 질문 전체가 되더라도 "석굴암은 언제..." 대신 "석굴암"으로
-        # 국가유산청/Daum 검색을 시작하도록 합니다.
-        question_match = re.match(
-            r"^\s*(.+?)(?:은|는|이|가|을|를|의|에서|에는|에)\s*(?:누구|누가|언제|왜|어디|무엇|뭐|어떤|몇|어떻게)",
-            query or "",
-        )
-        if question_match:
-            add(question_match.group(1))
-
-        add(re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}", " ", subject))
         add(subject)
+        add(re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}", " ", subject))
 
         # 괄호 안 명칭도 별도 후보로 둡니다. 예: 천마총(대릉원) -> 대릉원
         for inner in re.findall(r"\(([^)]+)\)|\[([^]]+)\]|\{([^}]+)\}", subject):
             add(next((part for part in inner if part), ""))
+
+        # 질문의 앞부분에서 장소/유산명으로 보이는 구절을 추출합니다.
+        # 예: "천마총은 누구 무덤이야?" -> "천마총"
+        question_match = re.match(
+            r"^\s*(.+?)(?:은|는|이|가|을|를|의|에서|에는|에)?\s*(?:누구|언제|왜|어디|무엇|뭐|어떤|몇|어떻게)",
+            query or "",
+        )
+        if question_match:
+            add(question_match.group(1))
 
         # 토큰 단위 후보는 너무 일반적인 말은 제외합니다.
         stop = {
@@ -7601,23 +7568,6 @@ class RagService:
                     add(token)
 
         return variants[:6]
-
-    @classmethod
-    def _context_matches_subject(
-        cls,
-        query: str,
-        exact_place: PlaceRecord | None,
-        context: dict,
-    ) -> bool:
-        subject = exact_place.title if exact_place is not None else query
-        variants = cls._external_subject_variants(subject, query)
-        subject_keys = [normalize_name(v) for v in variants[:4] if len(normalize_name(v)) >= 2]
-        if not subject_keys:
-            return False
-        searchable = normalize_name(
-            f"{context.get('title', '')} {context.get('overview', '')}"
-        )
-        return any(key in searchable for key in subject_keys)
 
     @staticmethod
     def _trusted_search_snippet_context(document: dict, source_name: str) -> dict | None:
@@ -7641,309 +7591,56 @@ class RagService:
             "source_name": source_name,
         }
 
-    @classmethod
-    def _is_heritage_fact_query(cls, query: str) -> bool:
-        compact = re.sub(r"\s+", "", query or "").lower()
-        tokens = (
-            "누구", "누가", "무덤", "피장자", "주인", "언제", "몇년", "몇년도",
-            "만들", "세웠", "건립", "창건", "조성", "완성", "시대", "유물", "출토",
-            "국보", "보물", "문화재", "원래이름", "왜지었", "왜만들",
-        )
-        return any(token in compact for token in tokens)
-
-    @staticmethod
-    def _heritage_query_intent(query: str) -> str:
-        compact = re.sub(r"\s+", "", query or "")
-        if (
-            any(token in compact for token in ("피장자", "무덤주인", "누구무덤", "누구의무덤"))
-            or ("무덤" in compact and any(token in compact for token in ("누구", "주인")))
-        ):
-            return "tomb_owner"
-        if any(token in compact for token in ("누가세웠", "누가지었", "누가만들", "누가창건")):
-            return "builder"
-        if any(token in compact for token in ("언제", "몇년", "몇년도", "시대")) and any(
-            token in compact for token in ("만들", "세웠", "지었", "창건", "건립", "조성", "완성")
-        ):
-            return "date"
-        if any(token in compact for token in ("유물", "출토", "나왔", "발견")):
-            return "artifact"
-        if any(token in compact for token in ("왜", "이유", "목적")):
-            return "reason"
-        return "generic"
-
-    @staticmethod
-    def _heritage_artifact_title(title: str) -> bool:
-        compact = normalize_name(title or "")
-        artifact_tokens = (
-            "금관", "관모", "금제", "은제", "귀걸이", "목걸이", "허리띠", "장신구",
-            "마구", "토기", "도기", "철기", "유물", "출토품", "관식", "천마도",
-        )
-        return any(token in compact for token in artifact_tokens)
-
-    @classmethod
-    def _direct_evidence_sentences(cls, query: str, context: dict) -> list[tuple[int, str]]:
-        """Return only sentences that actually answer the user's predicate.
-
-        A page merely mentioning the same heritage name is not evidence.  In
-        particular, artifact pages such as ``천마총 금관`` must never answer a
-        question about the tomb occupant unless the text explicitly discusses
-        the occupant/owner.
-        """
-        variants = cls._external_subject_variants(query, query)
-        subject_keys = [normalize_name(v) for v in variants[:4] if len(normalize_name(v)) >= 2]
-        intent = cls._heritage_query_intent(query)
-        title = str(context.get("title") or "")
-        title_key = normalize_name(title)
-        title_subject = any(key in title_key for key in subject_keys) if subject_keys else False
-        raw = str(context.get("overview") or "")
-        if not raw.strip():
-            return []
-
-        # Tomb-owner questions are especially vulnerable to artifact false positives.
-        artifact_title = cls._heritage_artifact_title(title)
-        strong_owner_patterns = (
-            r"(?:피장자|묘주|무덤(?:의)?\s*주인(?:공)?).{0,40}(?:미상|알\s*수\s*없|밝혀지지|확인되지|명확하지|전해지지|추정)",
-            r"(?:미상|알\s*수\s*없|밝혀지지|확인되지|명확하지|전해지지).{0,40}(?:피장자|묘주|무덤(?:의)?\s*주인(?:공)?)",
-            r"[가-힣]{2,12}(?:의\s*무덤|이\s*묻힌\s*무덤|을\s*묻은\s*무덤)",
-            # 국립박물관 전시 설명처럼 특정 인명을 제시하지 않고
-            # '왕(족)의 무덤'으로 분류하는 공식 문장도 직접근거로 인정합니다.
-            r"왕\s*\(?족\)?(?:의)?\s*무덤",
-            r"(?:피장자|묘주).{0,50}(?:[가-힣]{2,12}).{0,25}(?:추정|지목)",
-            r"(?:[가-힣]{2,12}).{0,25}(?:피장자|묘주).{0,25}(?:추정|지목)",
-            r"(?:잠정적으로\s*)?[가-힣]{2,12}(?:의)?\s*(?:왕릉|무덤)(?:으로)?\s*추정",
-        )
-
-        sentences: list[tuple[int, str]] = []
-        seen: set[str] = set()
-        # Split conservatively; Korean official pages often use line breaks rather than perfect punctuation.
-        for sentence in re.split(r"(?<=[.!?。])\s+|[\n\r]+", raw):
-            sentence = re.sub(r"\s+", " ", sentence).strip(" -·")
-            if len(sentence) < 12 or len(sentence) > 520 or sentence in seen:
-                continue
-            seen.add(sentence)
-            sentence_key = normalize_name(sentence)
-            subject_match = any(key in sentence_key for key in subject_keys) if subject_keys else False
-            if not (subject_match or title_subject):
-                continue
-
-            score = 0
-            if subject_match:
-                score += 30
-            elif title_subject:
-                score += 12
-
-            if intent == "tomb_owner":
-                strong = any(re.search(pattern, sentence) for pattern in strong_owner_patterns)
-                if not strong:
-                    continue
-                # Artifact pages can be used only when they contain explicit owner evidence.
-                if artifact_title:
-                    score -= 20
-                if any(word in sentence for word in ("피장자", "묘주", "무덤 주인", "무덤의 주인", "주인공")):
-                    score += 45
-                if any(word in sentence for word in ("미상", "알 수 없", "밝혀지지", "확인되지", "명확하지")):
-                    score += 35
-                if re.search(r"왕\s*\(?족\)?(?:의)?\s*무덤", sentence):
-                    score += 30
-                if any(word in sentence for word in ("추정", "지목", "왕릉")):
-                    score += 25
-            elif intent == "builder":
-                if not any(word in sentence for word in ("세웠", "지었", "창건", "건립", "조성", "완공", "완성", "시공")):
-                    continue
-                if not any(word in sentence for word in ("의해", "장인", "명하여", "명령", "건의", "김대성", "자장", "아비지", "선덕여왕")):
-                    continue
-                score += 55
-                if re.search(r"[가-힣]{2,8}(?:가|이|은|는|에게|에 의해)", sentence):
-                    score += 10
-            elif intent == "date":
-                if not re.search(r"(?:\d{3,4}년|\d{1,2}세기|신라\s*[가-힣]{2,8}\s*\d{1,2}년)", sentence):
-                    continue
-                if not any(word in sentence for word in ("시작", "창건", "건립", "조성", "완공", "완성", "만들", "세웠", "지었")):
-                    continue
-                score += 55
-            elif intent == "artifact":
-                if not any(word in sentence for word in ("출토", "발견", "유물", "금관", "천마도", "토기")):
-                    continue
-                score += 45
-            elif intent == "reason":
-                if not any(word in sentence for word in ("위해", "목적", "때문", "기원", "건의", "의미")):
-                    continue
-                score += 35
-            else:
-                score += 10
-
-            # Reward question vocabulary, but never let it replace the predicate gate above.
-            for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query or ""):
-                if token in {"알려줘", "알려", "누구", "누가", "언제", "어디", "뭐야", "무엇"}:
-                    continue
-                if normalize_name(token) in sentence_key:
-                    score += 4
-            sentences.append((score, sentence))
-
-        return sorted(sentences, key=lambda item: (item[0], -len(item[1])), reverse=True)
-
-    @classmethod
-    def _context_evidence_score(cls, query: str, context: dict) -> int:
-        evidence = cls._direct_evidence_sentences(query, context)
-        if not evidence:
-            return -10_000
-        source_name = str(context.get("source_name") or "")
-        authority = {
-            "국립경주박물관": 45,
-            "국가유산청": 42,
-            "국가유산포털": 40,
-            "국립문화유산연구원": 38,
-            "국립중앙박물관": 36,
-            "한국민족문화대백과사전": 34,
-            "경주시": 30,
-            "대한민국 구석구석": 20,
-        }.get(source_name, 0)
-        return evidence[0][0] + authority
-
-    @classmethod
-    def _extractive_context_answer(cls, query: str, contexts: list[dict]) -> str:
-        candidates: list[tuple[int, str]] = []
-        seen: set[str] = set()
-        for context in contexts:
-            for score, sentence in cls._direct_evidence_sentences(query, context):
-                if sentence in seen:
-                    continue
-                seen.add(sentence)
-                candidates.append((score, sentence))
-        if not candidates:
-            return "공식 자료를 찾았지만 질문에 직접 답하는 근거를 확인하지 못했습니다."
-        candidates.sort(key=lambda item: (item[0], -len(item[1])), reverse=True)
-        intent = cls._heritage_query_intent(query)
-        if intent == "date":
-            # Construction-date questions often need both start and completion years.
-            best = [item[1] for item in candidates[:2]]
-        else:
-            best = [item[1] for item in candidates[:2] if item[0] >= candidates[0][0] - 12]
-
-        answer = " ".join(best)
-        if intent == "tomb_owner":
-            unknown_markers = ("미상", "알 수 없", "밝혀지지", "확인되지", "명확하지", "전해지지")
-            if any(marker in answer for marker in unknown_markers):
-                return answer
-            if "추정" in answer or "지목" in answer or "왕릉" in answer:
-                return "피장자가 확정된 것은 아닙니다. " + answer
-            if re.search(r"왕\s*\(?족\)?(?:의)?\s*무덤", answer):
-                return (
-                    "공식 자료에서는 이 무덤을 왕(족)의 무덤으로 소개하고 있으며, "
-                    "확인한 자료에는 특정 피장자의 이름이 제시되어 있지 않습니다. " + answer
-                )
-        return answer
-
-    @classmethod
-    def _context_directly_answers_query(cls, query: str, context: dict) -> bool:
-        return cls._context_evidence_score(query, context) > -10_000
-
-    def _local_heritage_contexts(
-        self,
-        query: str,
-        exact_place: PlaceRecord | None,
-    ) -> list[dict]:
-        """동기화되어 있는 검증 역사문서에서 질문에 직접 답하는 자료만 고릅니다.
-
-        자주 묻는 문화유산 질문은 네트워크 API를 다시 호출하지 않고 먼저 이 로컬
-        코퍼스에서 답합니다. 장소명이 같은 것만 허용하고, '언제/누가/피장자' 같은
-        질문 의도에 직접 답하는 문장이 있는 문서만 통과시킵니다.
-        """
-        subject = exact_place.title if exact_place is not None else query
-        variants = self._external_subject_variants(subject, query)
-        subject_keys = [normalize_name(v) for v in variants[:4] if len(normalize_name(v)) >= 2]
-        if not subject_keys:
-            return []
-
-        rows = list(self.db.scalars(select(KnowledgeDocument)).all())
-        candidates: list[tuple[int, dict]] = []
-        for row in rows:
-            if row.category not in {"역사·정체성", "국가유산 공식자료", "공식 역사자료"}:
-                continue
-            searchable = normalize_name(f"{row.title} {row.text}")
-            title_key = normalize_name(row.title)
-            matched = [key for key in subject_keys if key in searchable]
-            if not matched:
-                continue
-            context = {
-                "title": row.title,
-                "category": row.category,
-                "overview": row.text,
-                "source_name": "검증 역사자료",
-            }
-            if not self._context_directly_answers_query(query, context):
-                continue
-            score = max((100 if key in title_key else 45) + len(key) for key in matched)
-            candidates.append((score, context))
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return [item[1] for item in candidates[: self.RAG_EXTERNAL_MAX_CONTEXTS]]
-
-    def _local_heritage_response(
-        self,
-        query: str,
-        exact_place: PlaceRecord | None,
-    ) -> RagSearchResponse | None:
-        contexts = self._local_heritage_contexts(query, exact_place)
-        if not contexts:
-            return None
-        answer = self._extractive_context_answer(query, contexts)
-        if "질문에 직접 답하는 근거를 확인하지 못했습니다" in answer:
-            return None
-        return RagSearchResponse(
-            query=query,
-            answer=self._clean_external_answer(answer),
-            hits=[self._external_hit(context, index) for index, context in enumerate(contexts)],
-            grounded=True,
-        )
-
-    @classmethod
-    def _compact_external_contexts(cls, contexts: list[dict]) -> list[dict]:
-        compacted: list[dict] = []
-        for context in contexts[: cls.RAG_EXTERNAL_MAX_CONTEXTS]:
-            item = dict(context)
-            item["overview"] = re.sub(
-                r"\s+", " ", str(item.get("overview") or "")
-            ).strip()[:2600]
-            compacted.append(item)
-        return compacted
-
-    @classmethod
-    def _remaining_rag_budget(cls, started_at: float) -> float:
-        return max(0.0, cls.RAG_TOTAL_BUDGET_SECONDS - (time.monotonic() - started_at))
-
-    async def _await_external_context_task(
-        self,
-        task: asyncio.Task | None,
-        *,
-        timeout: float,
-    ) -> list[dict]:
-        if task is None:
-            return []
-        try:
-            contexts = await asyncio.wait_for(asyncio.shield(task), timeout=max(0.2, timeout))
-        except (asyncio.TimeoutError, IntegrationError, ValueError):
-            return []
-        return self._compact_external_contexts(contexts)
-
     async def _external_official_contexts(
         self,
         query: str,
         exact_place: PlaceRecord | None,
     ) -> list[dict]:
-        """Search KHS + Daum concurrently, then rank by *answer evidence*, not name similarity."""
+        """내부 RAG가 부족할 때 공식 외부자료를 단계적으로 수집합니다.
+
+        순서:
+        1) 국가유산청 공개 Open API
+        2) Daum 웹문서 검색으로 공식 원문 URL 탐색
+        3) 신뢰 도메인 원문 직접 fetch
+        4) 원문 fetch가 막힌 경우에만 신뢰 도메인의 Daum 검색 요약 사용
+
+        ``천마총(대릉원)``처럼 TourAPI의 복합 장소명이 들어와도 검색용 별칭으로
+        ``천마총``을 함께 사용합니다.
+        """
         subject = exact_place.title if exact_place is not None else query
         variants = self._external_subject_variants(subject, query)
         if not variants:
             return []
 
-        cache_key = normalize_name(f"v10|{variants[0]}|{query}")
-        cached = self._external_context_cache.get(cache_key)
-        if cached and time.monotonic() - cached[0] <= self.RAG_EXTERNAL_CACHE_TTL_SECONDS:
-            return [dict(item) for item in cached[1]]
+        contexts: list[dict] = []
+        seen_urls: set[str] = set()
 
-        primary = variants[0]
-        intent = self._heritage_query_intent(query)
+        # 1) 국가유산청. 괄호가 붙은 TourAPI 명칭 그대로 한 번만 조회하지 않고
+        #    정제한 장소명 변형을 순차 조회합니다.
+        for variant in variants[:3]:
+            try:
+                heritage_contexts = await asyncio.wait_for(
+                    self.heritage.contexts(variant, limit=2),
+                    timeout=6.0,
+                )
+            except (IntegrationError, asyncio.TimeoutError, ValueError):
+                heritage_contexts = []
+
+            for context in heritage_contexts:
+                url = str(context.get("source_url") or "")
+                if url and url in seen_urls:
+                    continue
+                if url:
+                    seen_urls.add(url)
+                contexts.append(context)
+                if len(contexts) >= 3:
+                    break
+            if len(contexts) >= 3:
+                break
+
+        # 2) Daum 웹검색. 카카오 문서에 보장되지 않은 site: 연산자에 의존하지 않고
+        #    기관명을 검색어에 직접 넣습니다. 첫 검색은 질문 자체를 살려 의도(피장자 등)를
+        #    보존하고, 이후 검색은 국립경주박물관/국가유산청 등 공식기관명으로 보강합니다.
         search_queries: list[str] = []
 
         def add_query(value: str) -> None:
@@ -7951,298 +7648,156 @@ class RagService:
             if value and value not in search_queries:
                 search_queries.append(value)
 
-        if intent == "tomb_owner":
-            add_query(f"{primary} 피장자 무덤 주인 미상 밝혀지지")
-            add_query(f"{primary} 왕족 무덤 국립경주박물관")
-            add_query(f"{primary} 피장자 국립경주박물관")
-            add_query(f"{primary} 피장자 국립문화유산연구원")
-            add_query(f"{primary} 피장자 국가유산포털")
-            add_query(f"{primary} 피장자 한국민족문화대백과사전")
-            add_query(f"{primary} 왕릉 추정 한국민족문화대백과사전")
-        elif intent == "builder":
-            add_query(f"{primary} 누가 세웠 건립 장인 아비지 창건")
-            add_query(f"{primary} 건립 주체 경주문화관광")
-            add_query(f"{primary} 장인 국가유산포털")
-            add_query(f"{primary} 건립 한국민족문화대백과사전")
-        elif intent == "date":
-            add_query(f"{primary} 언제 창건 건립 완공 연대")
-            add_query(f"{primary} 몇 년 완성 국가유산포털")
-            add_query(f"{primary} 창건 국립경주박물관")
-            add_query(f"{primary} 창건 연대 한국민족문화대백과사전")
-        elif intent == "artifact":
-            add_query(f"{primary} 출토 유물")
-        add_query(query)
-        add_query(f"{primary} 국립경주박물관")
-        add_query(f"{primary} 국가유산포털")
-        add_query(f"{primary} 국가유산청")
-        add_query(f"{primary} 국립문화유산연구원")
-        add_query(f"{primary} 한국민족문화대백과사전")
+        for variant in variants[:3]:
+            if normalize_name(variant) in normalize_name(query):
+                add_query(query)
+            else:
+                add_query(f"{variant} {query}")
+            add_query(f"{variant} 국립경주박물관")
+            add_query(f"{variant} 국가유산청")
+            add_query(f"{variant} 국가유산포털")
+            add_query(f"{variant} 국립중앙박물관")
 
-        async def heritage_lookup(variant: str) -> list[dict]:
-            try:
-                return await asyncio.wait_for(
-                    self.heritage.contexts(variant, limit=4),
-                    timeout=self.RAG_HERITAGE_LOOKUP_TIMEOUT_SECONDS,
-                )
-            except (IntegrationError, asyncio.TimeoutError, ValueError):
-                return []
-
-        async def daum_lookup(search_query: str) -> list[dict]:
-            try:
-                return await asyncio.wait_for(
-                    self.daum.web_documents(search_query, limit=15),
-                    timeout=self.RAG_DAUM_LOOKUP_TIMEOUT_SECONDS,
-                )
-            except (IntegrationError, asyncio.TimeoutError, ValueError):
-                return []
-
-        # WARNING level is intentional during contest validation: Railway commonly hides INFO logs.
-        trace_queries = search_queries[:12]
-        logger.warning(
-            "RAG-TRACE search start query=%r intent=%s subject=%r variants=%s daum_queries=%s",
-            query, intent, primary, variants[:3], trace_queries,
-        )
-        print(
-            f"RAG-TRACE search start query={query!r} intent={intent} subject={primary!r} daum_queries={trace_queries!r}",
-            flush=True,
-        )
-        heritage_batches, daum_batches = await asyncio.gather(
-            asyncio.gather(*(heritage_lookup(v) for v in variants[:3])),
-            asyncio.gather(*(daum_lookup(q) for q in trace_queries)),
-        )
-        raw_heritage_counts = [len(batch) for batch in heritage_batches]
-        raw_daum_counts = [len(batch) for batch in daum_batches]
-        logger.warning(
-            "RAG-TRACE raw query=%r heritage=%s daum=%s",
-            query, raw_heritage_counts, raw_daum_counts,
-        )
-        print(
-            f"RAG-TRACE raw query={query!r} heritage={raw_heritage_counts!r} daum={raw_daum_counts!r}",
-            flush=True,
-        )
-
-        # 국립경주박물관 자체 검색 페이지도 보조 신뢰 소스로 직접 조회합니다.
-        # Daum 색인에 박물관 페이지가 빠져도 '왕(족)의 무덤, 천마총' 같은
-        # 공식 박물관 설명을 찾을 수 있게 합니다. 날짜 질문에는 불필요한 지연을
-        # 만들지 않도록 tomb_owner / builder 질문에만 1.5초 제한으로 사용합니다.
-        direct_trusted_contexts: list[dict] = []
-        if intent in {"tomb_owner", "builder"}:
-            try:
-                from urllib.parse import quote_plus
-                museum_search_url = (
-                    "https://gyeongju.museum.go.kr/mecsearch/search.do?field=board&kw="
-                    + quote_plus(primary)
-                )
-                museum_context = await asyncio.wait_for(
-                    self.trusted_web.fetch_document(
-                        museum_search_url, query=query, title=primary
-                    ),
-                    timeout=min(self.RAG_TRUSTED_FETCH_TIMEOUT_SECONDS, 1.5),
-                )
-                if museum_context:
-                    direct_trusted_contexts.append(museum_context)
-            except (IntegrationError, asyncio.TimeoutError, ValueError):
-                pass
-
-        # Collect more candidates first.  Do NOT truncate KHS results before Daum evidence is compared.
-        candidates: list[dict] = list(direct_trusted_contexts)
-        seen_urls: set[str] = set()
-        for batch in heritage_batches:
-            for context in batch:
-                url = str(context.get("source_url") or context.get("homepage") or "")
-                if url and url in seen_urls:
-                    continue
-                if url:
-                    seen_urls.add(url)
-                candidates.append(context)
+        # 역사 질문에 자주 쓰이는 핵심 표현도 검색어에 보강합니다.
+        if any(token in query for token in ("누구", "무덤", "피장자", "주인")):
+            add_query(f"{variants[0]} 피장자 무덤 주인")
+        if any(token in query for token in ("언제", "시대", "만들", "조성")):
+            add_query(f"{variants[0]} 조성 시기 시대")
 
         documents: list[dict] = []
-        seen_doc_urls: set[str] = set()
-        subject_keys = [normalize_name(v) for v in variants if normalize_name(v)]
-        authority_scores = {
-            "국립경주박물관": 55,
-            "국가유산청": 50,
-            "국가유산포털": 48,
-            "국립문화유산연구원": 45,
-            "국립중앙박물관": 42,
-            "한국민족문화대백과사전": 40,
-            "경주시": 30,
-            "대한민국 구석구석": 20,
-        }
-        for batch in daum_batches:
-            for document in batch:
+        seen_search_urls: set[str] = set()
+        subject_keys = [normalize_name(value) for value in variants if normalize_name(value)]
+        query_tokens = [
+            token
+            for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query)
+            if token not in {"알려줘", "알려", "누구", "뭐야", "어디", "경주"}
+        ]
+
+        for search_query in search_queries[:12]:
+            try:
+                found = await asyncio.wait_for(
+                    self.daum.web_documents(search_query, limit=30),
+                    timeout=5.0,
+                )
+            except (IntegrationError, asyncio.TimeoutError, ValueError):
+                continue
+            for document in found:
                 url = str(document.get("url") or "").strip()
-                if not url or url in seen_doc_urls:
+                if not url or url in seen_search_urls:
                     continue
                 source_name = self.trusted_web.trusted_source_name(url)
                 if not source_name:
                     continue
-                seen_doc_urls.add(url)
-                clean_title = self._clean_search_title(document.get("title"))
-                contents = re.sub(r"<[^>]+>", " ", str(document.get("contents") or ""))
-                contents = re.sub(r"\s+", " ", contents).strip()
-                searchable = normalize_name(f"{clean_title} {contents}")
-                subject_score = 100 if any(key in searchable for key in subject_keys) else 0
-                # Keep the result even when the snippet is too short; the official page fetch may contain the answer.
-                snippet = self._trusted_search_snippet_context(document, source_name)
-                snippet_evidence = self._context_evidence_score(query, snippet) if snippet else -10_000
-                docs_score = max(snippet_evidence, subject_score + authority_scores.get(source_name, 0))
+                seen_search_urls.add(url)
+                searchable = normalize_name(
+                    f"{document.get('title', '')} {document.get('contents', '')}"
+                )
+                score = 0
+                if any(key and key in searchable for key in subject_keys):
+                    score += 120
+                score += sum(6 for token in query_tokens if normalize_name(token) in searchable)
+                source_bonus = {
+                    "국립경주박물관": 55,
+                    "국가유산청": 50,
+                    "국가유산포털": 48,
+                    "국립문화유산연구원": 45,
+                    "국립중앙박물관": 42,
+                    "경주시": 30,
+                    "대한민국 구석구석": 20,
+                }.get(source_name, 0)
                 documents.append({
                     **document,
                     "source_name": source_name,
-                    "_snippet": snippet,
-                    "_evidence": snippet_evidence,
-                    "_score": docs_score,
+                    "_score": score + source_bonus,
                 })
-        # Fetch priority must preserve strong subject/authority matches even when the Daum
-        # snippet itself does not contain the answer. V10 sorted by _score and then immediately
-        # sorted again by _evidence, which could push the actual official answer page out of
-        # the very small fetch window. Use one combined ordering instead.
-        def fetch_priority(document: dict) -> tuple[int, int, int]:
-            evidence = int(document.get("_evidence") or -10_000)
-            score = int(document.get("_score") or -10_000)
-            has_direct_snippet = 1 if evidence > -10_000 else 0
-            return (has_direct_snippet, evidence, score)
 
-        documents.sort(key=fetch_priority, reverse=True)
-        fetch_candidates = documents[:10]
+        documents.sort(key=lambda item: int(item.get("_score") or 0), reverse=True)
+        fetch_candidates = [
+            doc for doc in documents
+            if str(doc.get("url") or "") not in seen_urls
+        ][:10]
 
-        async def fetch_document(document: dict) -> dict | None:
+        async def _fetch(document: dict):
             url = str(document.get("url") or "")
             try:
                 result = await asyncio.wait_for(
-                    self.trusted_web.fetch_document(url, query=query, title=primary),
-                    timeout=self.RAG_TRUSTED_FETCH_TIMEOUT_SECONDS,
+                    self.trusted_web.fetch_document(
+                        url,
+                        query=query,
+                        title=variants[0],
+                    ),
+                    timeout=6.0,
                 )
             except (IntegrationError, asyncio.TimeoutError, ValueError):
-                result = None
+                return None
             if result:
                 page_title = self._clean_search_title(document.get("title"))
                 if page_title:
                     result["title"] = f"{result.get('source_name', '공식 자료')} - {page_title}"
-                return result
-            return document.get("_snippet")
+            return result
 
-        fetched = await asyncio.gather(
-            *(fetch_document(document) for document in fetch_candidates),
-            return_exceptions=False,
-        ) if fetch_candidates else []
+        fetched = (
+            await asyncio.gather(
+                *(_fetch(document) for document in fetch_candidates),
+                return_exceptions=False,
+            )
+            if fetch_candidates
+            else []
+        )
+
         for context in fetched:
             if not context:
                 continue
-            url = str(context.get("source_url") or context.get("homepage") or "")
-            # A KHS URL may duplicate a fetched page; content can differ, so only suppress exact dict duplicates later.
-            candidates.append(context)
-
-        # Include high-quality trusted snippets that were not fetched, then rank *all* candidates by
-        # whether they answer the predicate (who/when/builder/etc.).
-        for document in documents[5:10]:
-            snippet = document.get("_snippet")
-            if snippet:
-                candidates.append(snippet)
-
-        ranked: list[tuple[int, dict]] = []
-        seen_fingerprint: set[str] = set()
-        for context in candidates:
-            if not self._context_matches_subject(query, exact_place, context):
+            url = str(context.get("source_url") or "")
+            if url and url in seen_urls:
                 continue
-            score = self._context_evidence_score(query, context)
-            if score <= -10_000:
-                continue
-            fp = normalize_name(f"{context.get('title','')}|{context.get('overview','')[:220]}")
-            if fp in seen_fingerprint:
-                continue
-            seen_fingerprint.add(fp)
-            ranked.append((score, context))
+            if url:
+                seen_urls.add(url)
+            contexts.append(context)
+            if len(contexts) >= 5:
+                return contexts[:5]
 
-        ranked.sort(key=lambda item: item[0], reverse=True)
-        candidate_preview = [
-            (str(c.get("source_name") or ""), str(c.get("title") or "")[:90])
-            for c in candidates[:12]
-        ]
-        print(
-            f"RAG-TRACE candidates query={query!r} preview={candidate_preview!r}",
-            flush=True,
-        )
-        contexts = [context for _, context in ranked[: self.RAG_EXTERNAL_MAX_CONTEXTS]]
-        ranked_preview = [(score, c.get("title")) for score, c in ranked[:5]]
-        logger.warning(
-            "RAG-TRACE ranked query=%r candidates=%d direct=%d top=%s",
-            query, len(candidates), len(contexts), ranked_preview,
-        )
-        print(
-            f"RAG-TRACE ranked query={query!r} candidates={len(candidates)} direct={len(contexts)} top={ranked_preview!r}",
-            flush=True,
-        )
-
-        if contexts:
-            self._external_context_cache[cache_key] = (
-                time.monotonic(),
-                [dict(item) for item in contexts],
+        # 4) 일부 공공기관은 Railway에서 원문 fetch가 막히거나 첨부/뷰어 URL을
+        #    반환하기도 합니다. 이때 답을 포기하지 않고, 신뢰 도메인으로 검증된 Daum
+        #    웹검색 결과의 본문 요약만 최후 fallback으로 사용합니다.
+        for document in documents:
+            url = str(document.get("url") or "")
+            if not url or url in seen_urls:
+                continue
+            source_name = str(document.get("source_name") or "")
+            if not source_name:
+                continue
+            context = self._trusted_search_snippet_context(document, source_name)
+            if not context:
+                continue
+            searchable = normalize_name(
+                f"{context.get('title', '')} {context.get('overview', '')}"
             )
-        return contexts
+            if subject_keys and not any(key in searchable for key in subject_keys):
+                continue
+            seen_urls.add(url)
+            contexts.append(context)
+            if len(contexts) >= 5:
+                break
+
+        return contexts[:5]
 
     async def _external_fallback_response(
         self,
         query: str,
         history: list[ChatTurn],
         exact_place: PlaceRecord | None,
-        *,
-        budget_seconds: float | None = None,
-        prefetched_contexts: list[dict] | None = None,
     ) -> RagSearchResponse | None:
-        budget = min(
-            budget_seconds if budget_seconds is not None else self.RAG_TOTAL_BUDGET_SECONDS,
-            self.RAG_TOTAL_BUDGET_SECONDS,
-        )
-        started = time.monotonic()
-        contexts = [
-            context
-            for context in self._compact_external_contexts(prefetched_contexts or [])
-            if self._context_matches_subject(query, exact_place, context)
-        ]
-        if not contexts:
-            context_timeout = min(self.RAG_EXTERNAL_CONTEXT_TIMEOUT_SECONDS, max(0.5, budget - 1.0))
-            try:
-                contexts = await asyncio.wait_for(
-                    self._external_official_contexts(query, exact_place),
-                    timeout=context_timeout,
-                )
-            except (asyncio.TimeoutError, IntegrationError, ValueError):
-                return None
+        contexts = await self._external_official_contexts(query, exact_place)
         if not contexts:
             return None
 
-        remaining = max(0.5, budget - (time.monotonic() - started))
-        extractive = self._extractive_context_answer(query, contexts)
-        direct_extract = "질문에 직접 답하는 근거를 확인하지 못했습니다" not in extractive
-
-        if self._is_heritage_fact_query(query) and direct_extract:
-            # 역사 사실 질문은 이미 공식문서에 직접근거가 있으면 모델 재서술을 기다리지 않습니다.
-            # 관련 없는 자료를 섞거나 10초 이상 지연되는 현상을 동시에 막습니다.
-            answer = extractive
-        elif self._is_heritage_fact_query(query):
-            # 공식자료를 찾았더라도 질문에 직접 답하는 문장이 없으면 LLM 추정을 금지합니다.
-            return None
-        else:
-            try:
-                answer = await asyncio.wait_for(
-                    self.openai.answer_with_context(query, contexts, history=history),
-                    timeout=min(self.RAG_EXTERNAL_ANSWER_TIMEOUT_SECONDS, remaining),
-                )
-            except (asyncio.TimeoutError, IntegrationError, ValueError):
-                answer = extractive
-
-            if self._answer_needs_external_fallback(answer) and direct_extract:
-                answer = extractive
-
-        # 출력 정리 패치가 이미 적용된 버전이면 URL 제거/"피장자 미상" 정상답변
-        # 처리를 그대로 재사용합니다. 미적용 버전에서도 동작하도록 선택 호출합니다.
-        cleaner = getattr(self, "_clean_external_answer", None)
-        if callable(cleaner):
-            answer = cleaner(answer)
-        unknown_checker = getattr(self, "_answer_is_grounded_unknown", None)
-        grounded_unknown = bool(unknown_checker(answer)) if callable(unknown_checker) else False
+        # 화면과 모델에 너무 많은 출처를 넘기지 않습니다. 공식성/관련도 순으로 이미 정렬된
+        # 상위 3개만 사용하면 답변 집중도와 모바일 UI 가독성이 좋아집니다.
+        contexts = contexts[:3]
+        answer = await self.openai.answer_with_context(query, contexts, history=history)
+        answer = self._clean_external_answer(answer)
+        grounded_unknown = self._answer_is_grounded_unknown(answer)
         grounded = grounded_unknown or not self._answer_needs_external_fallback(answer)
         return RagSearchResponse(
             query=query,
@@ -8257,7 +7812,6 @@ class RagService:
         top_k: int,
         history: list[ChatTurn] | None = None,
     ) -> RagSearchResponse:
-        request_started = time.monotonic()
         history = history or []
 
         # 의미검색에는 직전 사용자 발화를 보강해 지시어("그거", "거기") 문맥을 살립니다.
@@ -8283,73 +7837,7 @@ class RagService:
                 grounded=grounded,
             )
 
-        # 역사/문화유산의 사실 질문은 일반 내부 RAG보다 공식자료를 우선합니다.
-        # 내부 KnowledgeDocument에는 예절/접근성 등 다른 주제 문서가 많아,
-        # "석굴암은 언제 만들어졌어?" 같은 질문에 엉뚱한 고득점 문서가 섞일 수 있습니다.
-        # 이런 질문은 국가유산청/국립박물관/경주시 등 신뢰 자료에서만 답하고,
-        # 공식자료가 없으면 관련 없는 내부 문서로 억지 답변하지 않습니다.
-        is_heritage_fact = self._is_heritage_fact_query(query)
-        external_context_task: asyncio.Task | None = None
-        if is_heritage_fact:
-            # 문화유산 사실 질문은 국가유산청/Daum 공식검색을 *항상* 시도합니다.
-            # 로컬 DB는 외부 공식검색이 실패했을 때만 보조 fallback으로 사용합니다.
-            local_heritage = self._local_heritage_response(query, exact_place)
-            remaining = self._remaining_rag_budget(request_started)
-            primary_budget = min(10.5, max(1.0, remaining))
-            logger.info(
-                "RAG heritage branch query=%r exact_place=%r local_grounded=%s budget=%.2f",
-                query, exact_place.title if exact_place is not None else None,
-                local_heritage is not None, primary_budget,
-            )
-            try:
-                external = await asyncio.wait_for(
-                    self._external_fallback_response(
-                        query,
-                        history,
-                        exact_place,
-                        budget_seconds=primary_budget,
-                    ),
-                    timeout=primary_budget,
-                )
-            except (asyncio.TimeoutError, IntegrationError, ValueError) as exc:
-                logger.warning("RAG external fallback failed query=%r error=%s", query, exc)
-                external = None
-
-            # 질문에 직접 답하는 외부 공식근거가 있으면 로컬 DB보다 항상 우선합니다.
-            if external is not None and external.grounded and external.hits:
-                return external
-
-            # 외부 API가 일시적으로 실패했을 때만 검증 로컬 자료를 사용합니다.
-            if local_heritage is not None:
-                return local_heritage
-
-            return RagSearchResponse(
-                query=query,
-                answer=(
-                    "질문과 직접 관련된 공식 문화유산 자료를 확인하지 못했습니다. "
-                    "관련 없는 자료로 추정해 답하지 않겠습니다."
-                ),
-                hits=external.hits if external is not None else [],
-                grounded=False,
-            )
-
-        try:
-            vector = (await asyncio.wait_for(
-                self.openai.embeddings([search_text]),
-                timeout=min(
-                    self.RAG_EMBEDDING_TIMEOUT_SECONDS,
-                    max(0.8, self._remaining_rag_budget(request_started)),
-                ),
-            ))[0]
-        except (asyncio.TimeoutError, IntegrationError, ValueError, IndexError):
-            if external_context_task is not None:
-                external_context_task.cancel()
-            return RagSearchResponse(
-                query=query,
-                answer="검색이 잠시 지연되고 있습니다. 잠시 후 다시 질문해 주세요.",
-                hits=[],
-                grounded=False,
-            )
+        vector = (await self.openai.embeddings([search_text]))[0]
 
         place_records = [record for record in all_place_records if record.embedding]
         doc_records = list(
@@ -8408,28 +7896,11 @@ class RagService:
         )
 
         if not selected or selected[0][0] < self.settings.rag_min_similarity:
-            prefetched = await self._await_external_context_task(
-                external_context_task,
-                timeout=min(
-                    self.RAG_EXTERNAL_CONTEXT_TIMEOUT_SECONDS,
-                    max(0.5, self._remaining_rag_budget(request_started) - 1.0),
-                ),
+            external = await self._external_fallback_response(
+                query, history, exact_place
             )
-            remaining = self._remaining_rag_budget(request_started)
-            if remaining > 0.8:
-                try:
-                    external = await asyncio.wait_for(
-                        self._external_fallback_response(
-                            query, history, exact_place,
-                            budget_seconds=remaining,
-                            prefetched_contexts=prefetched,
-                        ),
-                        timeout=max(0.5, remaining),
-                    )
-                except asyncio.TimeoutError:
-                    external = None
-                if external is not None:
-                    return external
+            if external is not None:
+                return external
             return RagSearchResponse(
                 query=query,
                 answer=(
@@ -8452,11 +7923,9 @@ class RagService:
                     {
                         "title": record.title,
                         "category": record.category,
-                        "overview": (record.text or "")[:2600],
+                        "overview": record.text,
                     }
                 )
-
-        contexts = contexts[: self.RAG_INTERNAL_MAX_CONTEXTS]
 
         hits: list[RagHit] = []
         for score, source_type, record in display_pool:
@@ -8474,40 +7943,14 @@ class RagService:
                     )
                 )
 
-        remaining = self._remaining_rag_budget(request_started)
-        try:
-            answer = await asyncio.wait_for(
-                self.openai.answer_with_context(query, contexts, history=history),
-                timeout=min(self.RAG_INTERNAL_ANSWER_TIMEOUT_SECONDS, max(0.8, remaining)),
-            )
-        except (asyncio.TimeoutError, IntegrationError, ValueError):
-            answer = "확인할 수 있는 자료가 부족합니다."
+        answer = await self.openai.answer_with_context(query, contexts, history=history)
 
         if self._answer_needs_external_fallback(answer):
-            prefetched = await self._await_external_context_task(
-                external_context_task,
-                timeout=min(
-                    self.RAG_EXTERNAL_CONTEXT_TIMEOUT_SECONDS,
-                    max(0.2, self._remaining_rag_budget(request_started) - 0.8),
-                ),
+            external = await self._external_fallback_response(
+                query, history, exact_place
             )
-            remaining = self._remaining_rag_budget(request_started)
-            if remaining > 0.8:
-                try:
-                    external = await asyncio.wait_for(
-                        self._external_fallback_response(
-                            query, history, exact_place,
-                            budget_seconds=remaining,
-                            prefetched_contexts=prefetched,
-                        ),
-                        timeout=max(0.5, remaining),
-                    )
-                except asyncio.TimeoutError:
-                    external = None
-                if external is not None:
-                    return external
-        elif external_context_task is not None and not external_context_task.done():
-            external_context_task.cancel()
+            if external is not None:
+                return external
 
         return RagSearchResponse(
             query=query,

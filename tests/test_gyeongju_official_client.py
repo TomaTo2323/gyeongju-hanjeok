@@ -133,7 +133,7 @@ def test_official_verified_snapshot_works_when_network_is_unavailable(monkeypatc
         )
     )
 
-    assert result["operating_hours"].replace(" ", "").startswith("09:00-22:00")
+    assert result["operating_hours"] == "09:00 -22:00 (동절기 21:00까지)"
     assert result["rest_date"] == "연중무휴"
     assert result["fee_text"] == "무료"
     assert "쪽샘임시주차장" in result["parking"]
@@ -145,6 +145,7 @@ def test_official_verified_snapshot_works_when_network_is_unavailable(monkeypatc
 def test_official_domain_search_snippet_is_last_resort_when_page_fetch_fails(monkeypatch):
     client = GyeongjuOfficialTourClient(_settings())
 
+    # Use a non-seeded name so this exercises the generic official-domain path.
     async def fake_web_documents(query, limit=10):
         return [{
             "title": "테스트명소 - 경주문화관광",
@@ -163,5 +164,5 @@ def test_official_domain_search_snippet_is_last_resort_when_page_fetch_fails(mon
         client.place_info("테스트명소", {"operating_hours", "fee_text"})
     )
 
-    assert result["operating_hours"].replace(" ", "").startswith("09:00-18:00")
+    assert result["operating_hours"].startswith("09:00-18:00")
     assert result["source_url"].startswith("https://www.gyeongju.go.kr/tour/")

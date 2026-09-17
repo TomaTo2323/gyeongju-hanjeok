@@ -1101,8 +1101,9 @@ class GyeongjuOfficialTourClient(BaseClient):
     }
 
     # 경주시 공식 관광 페이지에서 직접 검증한 최소 방문정보 스냅샷입니다.
-    # Railway 등 런타임 환경에서 경주시 홈페이지 본문 요청이 차단/지연되어도
-    # 핵심 관광지는 공식 페이지에 명시된 값만 안전하게 답할 수 있습니다.
+    # Railway 등 런타임 환경에서 경주시 홈페이지 요청이 차단/지연되는 경우에도
+    # 핵심 관광지는 "공식 페이지에 값이 분명히 있는 경우"에 한해 안전하게 답합니다.
+    # 이 값들은 일반 웹/블로그가 아니라 아래 source_url의 경주시 공식 페이지 기준입니다.
     VERIFIED_OFFICIAL_FACTS: dict[str, dict[str, str]] = {
         "첨성대": {
             "source_url": (
@@ -1278,10 +1279,9 @@ class GyeongjuOfficialTourClient(BaseClient):
         if short_title.startswith("경주 "):
             short_title = short_title[3:].strip()
 
-        # 먼저 검증된 경주시 공식 스냅샷을 확인합니다.
-        # V2는 공식 URL만 고정했기 때문에 이후 _get_text(url)가 실패하면
-        # 결국 빈 결과가 됐습니다. V3는 핵심 관광지의 검증된 공식 필드는
-        # 네트워크 요청보다 먼저 반환합니다.
+        # 1) 경주시 공식 페이지에서 이미 검증한 핵심 관광지 스냅샷을 우선 사용합니다.
+        #    외부 사이트가 아니라 경주시 공식 페이지의 최소 방문정보만 저장하며,
+        #    requested_fields에 필요한 값만 반환합니다.
         compact_title = re.sub(r"[^0-9a-z가-힣]", "", short_title.lower())
         for known_title, facts in self.VERIFIED_OFFICIAL_FACTS.items():
             compact_known = re.sub(r"[^0-9a-z가-힣]", "", known_title.lower())
@@ -1374,8 +1374,8 @@ class GyeongjuOfficialTourClient(BaseClient):
                 raw_html = await asyncio.wait_for(self._get_text(url), timeout=4.0)
             except (IntegrationError, asyncio.TimeoutError):
                 # Railway에서 경주시 홈페이지 본문 직접 요청이 실패할 수 있습니다.
-                # 이 경우에도 현재 경주시 공식 도메인 검색결과의 제목/설명만
-                # 마지막 보조근거로 사용합니다. 비공식 URL은 이미 제외됩니다.
+                # 이 경우에도 "공식 도메인 검색결과"의 제목/설명만 마지막 보조근거로
+                # 사용합니다. 비공식 도메인은 candidates 단계에서 이미 제외됩니다.
                 raw_html = ""
 
             if raw_html:
@@ -1456,11 +1456,13 @@ class KoreanHeritageClient(BaseClient):
 
     @classmethod
     def _xml_value(cls, item: ET.Element | None, name: str) -> str:
-        """국가유산청 XML 필드를 대소문자/네임스페이스 차이에 강하게 읽습니다.
+        """Read KHS XML fields case-insensitively and across minor schema variants.
 
-        오래 운영된 Open API 특성상 camelCase/lowercase 예시가 혼재할 수 있습니다.
-        ElementTree의 find()는 대소문자를 구분하므로, 필드가 실제로 있어도 빈 값으로
-        인식되는 문제를 막기 위해 로컬 태그명을 소문자로 비교하고 하위 노드까지 읽습니다.
+        The heritage Open API has existed for many years and examples in the wild
+        include both camelCase and lower-case tag names. ElementTree's ``find`` is
+        case-sensitive, so a response such as ``<ccbamnm1>`` would otherwise look
+        empty even though the value is present. We also search descendants so
+        nested ``<ccbaCndt><content>...`` descriptions are usable.
         """
         if item is None:
             return ""
@@ -1468,11 +1470,7 @@ class KoreanHeritageClient(BaseClient):
         for node in item.iter():
             if cls._local_xml_name(node.tag) != wanted:
                 continue
-            value = " ".join(
-                part.strip()
-                for part in node.itertext()
-                if part and part.strip()
-            )
+            value = " ".join(part.strip() for part in node.itertext() if part and part.strip())
             value = re.sub(r"\s+", " ", value).strip()
             if value:
                 return value
@@ -1480,11 +1478,7 @@ class KoreanHeritageClient(BaseClient):
 
     @classmethod
     def _xml_items(cls, root: ET.Element) -> list[ET.Element]:
-        return [
-            node
-            for node in root.iter()
-            if cls._local_xml_name(node.tag) == "item"
-        ]
+        return [node for node in root.iter() if cls._local_xml_name(node.tag) == "item"]
 
     @staticmethod
     def _compact(value: str) -> str:
@@ -1553,8 +1547,8 @@ class KoreanHeritageClient(BaseClient):
             if not (kind and number and province_code):
                 continue
 
-            # 상세 endpoint가 일시 실패하더라도 목록 결과에 설명/시대/주소가 있으면
-            # 국가유산 공식 근거를 버리지 않습니다.
+            # A detail endpoint outage should not throw away a useful list result.
+            # The list response itself often contains period/address/content fields.
             detail: ET.Element | None = None
             try:
                 detail_raw = await self._get_xml(
@@ -1572,63 +1566,30 @@ class KoreanHeritageClient(BaseClient):
                 detail = None
 
             source = detail if detail is not None else item
-            name = (
-                self._xml_value(source, "ccbaMnm1")
-                or self._xml_value(item, "ccbaMnm1")
-            )
-            content = (
-                self._xml_value(source, "content")
-                or self._xml_value(item, "content")
-            )
+            name = self._xml_value(source, "ccbaMnm1") or self._xml_value(item, "ccbaMnm1")
+            content = self._xml_value(source, "content") or self._xml_value(item, "content")
             fields = [
-                (
-                    "국가유산 종목",
-                    self._xml_value(source, "ccmaName")
-                    or self._xml_value(item, "ccmaName"),
-                ),
-                (
-                    "시대",
-                    self._xml_value(source, "ccceName")
-                    or self._xml_value(item, "ccceName"),
-                ),
-                (
-                    "소재지",
-                    self._xml_value(source, "ccbaLcad")
-                    or self._xml_value(item, "ccbaLcad"),
-                ),
-                (
-                    "관리자",
-                    self._xml_value(source, "ccbaAdmin")
-                    or self._xml_value(item, "ccbaAdmin"),
-                ),
+                ("국가유산 종목", self._xml_value(source, "ccmaName") or self._xml_value(item, "ccmaName")),
+                ("시대", self._xml_value(source, "ccceName") or self._xml_value(item, "ccceName")),
+                ("소재지", self._xml_value(source, "ccbaLcad") or self._xml_value(item, "ccbaLcad")),
+                ("관리자", self._xml_value(source, "ccbaAdmin") or self._xml_value(item, "ccbaAdmin")),
             ]
-            prefix = " / ".join(
-                f"{label}: {value}"
-                for label, value in fields
-                if value
-            )
-            overview = "\n".join(
-                part for part in (prefix, content) if part
-            ).strip()
+            prefix = " / ".join(f"{label}: {value}" for label, value in fields if value)
+            overview = "\n".join(part for part in (prefix, content) if part).strip()
             if not overview:
                 continue
 
-            cpno = (
-                self._xml_value(source, "ccbaCpno")
-                or self._xml_value(item, "ccbaCpno")
-            )
+            cpno = self._xml_value(source, "ccbaCpno") or self._xml_value(item, "ccbaCpno")
             if cpno:
                 source_url = (
                     "https://m.khs.go.kr/public/commentary/culSelectDetail.do"
-                    f"?ccbaAsno={number}&ccbaCpno={cpno}"
-                    f"&ccbaCtcd={province_code}&ccbaKdcd={kind}&menuId=03"
+                    f"?ccbaAsno={number}&ccbaCpno={cpno}&ccbaCtcd={province_code}"
+                    f"&ccbaKdcd={kind}&menuId=03"
                 )
             else:
                 source_url = (
-                    f"{self.DETAIL_URL}?ccbaKdcd={kind}"
-                    f"&ccbaAsno={number}&ccbaCtcd={province_code}"
+                    f"{self.DETAIL_URL}?ccbaKdcd={kind}&ccbaAsno={number}&ccbaCtcd={province_code}"
                 )
-
             results.append(
                 {
                     "title": f"국가유산청 - {name}",
@@ -1684,7 +1645,6 @@ class TrustedWebSourceClient(BaseClient):
         "nrich.go.kr": "국립문화유산연구원",
         "museum.go.kr": "국립중앙박물관",
         "gyeongju.museum.go.kr": "국립경주박물관",
-        "encykorea.aks.ac.kr": "한국민족문화대백과사전",
         "gyeongju.go.kr": "경주시",
         "visitkorea.or.kr": "대한민국 구석구석",
     }
@@ -1811,8 +1771,6 @@ class TrustedWebSourceClient(BaseClient):
             "source_url": final_url,
             "source_name": final_source_name,
         }
-
-
 
 
 class RegionalVisitorClient(BaseClient):
