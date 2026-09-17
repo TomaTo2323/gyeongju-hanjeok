@@ -3052,124 +3052,112 @@ async def _load_place_detail_full(
 @compat_router.get("/places/{place_id}")
 async def front_place_detail(
     place_id: str,
-    content_type_id: str = "",
+    content_type_id: str = "12",
     title: str = "",
     address: str = "",
-    stage: str = "core",
-    settings: Settings = Depends(
-        get_settings
-    ),
+    stage: str = "full",
+    settings: Settings = Depends(get_settings),
 ):
-    """
-    홈/지도/코스/저장한 장소가 공통으로 사용하는 단일 상세조회 API.
+    # 프론트가 보유한 장소명으로 현재 TourAPI 레코드를 다시 찾은 뒤 상세 조회합니다.
+    # 사용자 현재 위치는 이 API로 받지 않습니다.
+    tour = TourApiClient(settings)
 
-    stage=core:
-      TourAPI 공식정보 + Kakao 연결 + 혼잡도만 빠르게 반환
+    supplied_title = title.strip()
+    supplied_address = address.strip()
 
-    stage=full:
-      core 결과를 재사용해 공식 홈페이지/NAVER 보완,
-      메뉴가격, 정확 일치 블로그/YouTube까지 추가
-    """
-    normalized_stage = (
-        stage.strip().lower()
-    )
+    seed: Place | None = None
+    resolved_by = "content_id"
 
-    if normalized_stage not in {
-        "core",
-        "full",
-    }:
-        normalized_stage = "core"
+    if supplied_title:
+        try:
+            candidates = await tour.keyword_search(
+                supplied_title,
+                limit=30,
+            )
+        except IntegrationError:
+            candidates = []
 
-    key = _place_detail_cache_key(
-        place_id,
-        title,
-    )
+        normalized_title = normalize_name(supplied_title)
 
-    # 이미 full 결과가 있으면 core 요청에도 즉시 full을 사용합니다.
-    full_cached = (
-        _place_detail_cache_get(
-            _PLACE_DETAIL_FULL_CACHE,
-            key,
+        seed = next(
+            (
+                candidate
+                for candidate in candidates
+                if normalize_name(candidate.title) == normalized_title
+            ),
+            None,
         )
-    )
 
-    if full_cached is not None:
-        return {
-            "place":
-                _place_to_front(
-                    full_cached
-                )
-        }
+        if seed is None:
+            seed = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.place_id == place_id
+                ),
+                None,
+            )
 
-    core = _place_detail_cache_get(
-        _PLACE_DETAIL_CORE_CACHE,
-        key,
-    )
+        if seed is None:
+            seed = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if (
+                        normalized_title in normalize_name(candidate.title)
+                        or normalize_name(candidate.title) in normalized_title
+                    )
+                    and (
+                        not candidate.address
+                        or "경주" in candidate.address
+                    )
+                ),
+                None,
+            )
 
-    if core is None:
+        if seed is not None:
+            resolved_by = "keyword_search"
+
+    if seed is None:
         seed = Place(
             place_id=place_id,
-            content_type_id=(
-                content_type_id
-                or None
-            ),
-            title=(
-                title.strip()
-                or place_id
-            ),
-            address=(
-                address.strip()
-                or None
-            ),
+            content_type_id=content_type_id,
+            title=supplied_title or place_id,
+            address=supplied_address or None,
             latitude=DEFAULT_LATITUDE,
             longitude=DEFAULT_LONGITUDE,
         )
 
-        core = await _load_place_detail_core(
-            seed=seed,
-            settings=settings,
+    if not seed.content_type_id and content_type_id:
+        seed.content_type_id = content_type_id
+
+    try:
+        place = await tour.detail(seed)
+    except IntegrationError:
+        place = seed
+
+    if supplied_title and (
+        not place.title
+        or place.title == place.place_id
+    ):
+        place.title = supplied_title
+
+    if supplied_address and not place.address:
+        place.address = supplied_address
+
+    place = (
+        await _enrich_congestion(
+            [place],
+            settings,
             latitude=DEFAULT_LATITUDE,
             longitude=DEFAULT_LONGITUDE,
         )
+    )[0]
 
-        _place_detail_cache_set(
-            _PLACE_DETAIL_CORE_CACHE,
-            key,
-            core,
-        )
-
-    if normalized_stage == "core":
-        return {
-            "place":
-                _place_to_front(
-                    core
-                )
-        }
-
-    full = await _load_place_detail_full(
-        core=core,
-        settings=settings,
-    )
-
-    _place_detail_cache_set(
-        _PLACE_DETAIL_FULL_CACHE,
-        key,
-        full,
-    )
-
-    # full 결과를 core 캐시에도 올려 다음 진입을 즉시 처리합니다.
-    _place_detail_cache_set(
-        _PLACE_DETAIL_CORE_CACHE,
-        key,
-        full,
-    )
-
-    return {
-        "place":
-            _place_to_front(
-                full
-            )
-    }
+    result = _place_to_front(place)
+    result["detail_resolved_by"] = resolved_by
+    result["requested_place_id"] = place_id
+    return {"place": result}
 
 
 @compat_router.get("/congestion/now")
