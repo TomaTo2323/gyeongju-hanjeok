@@ -7485,6 +7485,80 @@ class RagService:
         text = re.sub(r"<[^>]+>", " ", str(value or ""))
         return re.sub(r"\s+", " ", text).strip()
 
+    @staticmethod
+    def _external_subject_variants(subject: str, query: str) -> list[str]:
+        """외부 공식자료 검색용 장소명 변형을 만듭니다.
+
+        TourAPI 장소명에는 ``천마총(대릉원)``처럼 상위 관광지명이 괄호로 붙는
+        경우가 있어 국가유산/박물관 검색에서 그대로 쓰면 검색률이 크게 떨어집니다.
+        검색용으로만 괄호를 제거하고, 질문에서 드러난 핵심 명칭도 보조 후보로 사용합니다.
+        """
+
+        def clean(value: str) -> str:
+            value = re.sub(r"\s+", " ", value or "").strip()
+            value = re.sub(r"^경주\s+", "", value).strip()
+            return value.strip(" -·/|,")
+
+        variants: list[str] = []
+
+        def add(value: str) -> None:
+            value = clean(value)
+            if len(value) >= 2 and value not in variants:
+                variants.append(value)
+
+        add(subject)
+        add(re.sub(r"\([^)]*\)|\[[^]]*\]|\{[^}]*\}", " ", subject))
+
+        # 괄호 안 명칭도 별도 후보로 둡니다. 예: 천마총(대릉원) -> 대릉원
+        for inner in re.findall(r"\(([^)]+)\)|\[([^]]+)\]|\{([^}]+)\}", subject):
+            add(next((part for part in inner if part), ""))
+
+        # 질문의 앞부분에서 장소/유산명으로 보이는 구절을 추출합니다.
+        # 예: "천마총은 누구 무덤이야?" -> "천마총"
+        question_match = re.match(
+            r"^\s*(.+?)(?:은|는|이|가|을|를|의|에서|에는|에)?\s*(?:누구|언제|왜|어디|무엇|뭐|어떤|몇|어떻게)",
+            query or "",
+        )
+        if question_match:
+            add(question_match.group(1))
+
+        # 토큰 단위 후보는 너무 일반적인 말은 제외합니다.
+        stop = {
+            "누구", "언제", "어디", "무엇", "뭐야", "어떤", "왜", "어떻게",
+            "무덤", "정보", "설명", "알려줘", "알려", "경주",
+        }
+        for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query or ""):
+            token = re.sub(r"(?:은|는|이|가|을|를|의|에서|에는|에)$", "", token)
+            if token not in stop and len(token) >= 2:
+                subject_key = normalize_name(clean(subject))
+                token_key = normalize_name(token)
+                if not subject_key or token_key in subject_key or subject_key in token_key:
+                    add(token)
+
+        return variants[:6]
+
+    @staticmethod
+    def _trusted_search_snippet_context(document: dict, source_name: str) -> dict | None:
+        """원문 fetch가 막힐 때 신뢰 도메인의 Daum 검색 요약을 최후 fallback으로 사용합니다.
+
+        일반 웹문서의 검색 요약은 사용하지 않습니다. URL이 신뢰 도메인으로 검증된
+        결과만 허용하고, 화면에도 원문 URL을 함께 노출합니다.
+        """
+        title = RagService._clean_search_title(document.get("title"))
+        contents = re.sub(r"<[^>]+>", " ", str(document.get("contents") or ""))
+        contents = re.sub(r"\s+", " ", contents).strip()
+        url = str(document.get("url") or "").strip()
+        if not title or len(contents) < 30 or not url:
+            return None
+        return {
+            "title": f"{source_name} - {title}",
+            "category": "공식 웹검색 요약",
+            "overview": contents[:3000],
+            "homepage": url,
+            "source_url": url,
+            "source_name": source_name,
+        }
+
     async def _external_official_contexts(
         self,
         query: str,
@@ -7494,51 +7568,84 @@ class RagService:
 
         순서:
         1) 국가유산청 공개 Open API
-        2) Daum 웹문서 검색
-        3) 신뢰 도메인으로 판정된 원문 URL만 직접 fetch
+        2) Daum 웹문서 검색으로 공식 원문 URL 탐색
+        3) 신뢰 도메인 원문 직접 fetch
+        4) 원문 fetch가 막힌 경우에만 신뢰 도메인의 Daum 검색 요약 사용
 
-        Daum의 검색 스니펫은 답변 근거로 직접 쓰지 않습니다.
+        ``천마총(대릉원)``처럼 TourAPI의 복합 장소명이 들어와도 검색용 별칭으로
+        ``천마총``을 함께 사용합니다.
         """
         subject = exact_place.title if exact_place is not None else query
-        short_subject = subject.strip()
-        if short_subject.startswith("경주 "):
-            short_subject = short_subject[3:].strip()
+        variants = self._external_subject_variants(subject, query)
+        if not variants:
+            return []
 
         contexts: list[dict] = []
         seen_urls: set[str] = set()
 
-        # 1) 국가유산청 공식 Open API. 장애 시 다음 단계로 조용히 넘어갑니다.
-        try:
-            heritage_contexts = await asyncio.wait_for(
-                self.heritage.contexts(short_subject, limit=2),
-                timeout=6.0,
-            )
-        except (IntegrationError, asyncio.TimeoutError, ValueError):
-            heritage_contexts = []
+        # 1) 국가유산청. 괄호가 붙은 TourAPI 명칭 그대로 한 번만 조회하지 않고
+        #    정제한 장소명 변형을 순차 조회합니다.
+        for variant in variants[:3]:
+            try:
+                heritage_contexts = await asyncio.wait_for(
+                    self.heritage.contexts(variant, limit=2),
+                    timeout=6.0,
+                )
+            except (IntegrationError, asyncio.TimeoutError, ValueError):
+                heritage_contexts = []
 
-        for context in heritage_contexts:
-            url = str(context.get("source_url") or "")
-            if url and url in seen_urls:
-                continue
-            if url:
-                seen_urls.add(url)
-            contexts.append(context)
+            for context in heritage_contexts:
+                url = str(context.get("source_url") or "")
+                if url and url in seen_urls:
+                    continue
+                if url:
+                    seen_urls.add(url)
+                contexts.append(context)
+                if len(contexts) >= 3:
+                    break
+            if len(contexts) >= 3:
+                break
 
-        # 2) Daum 검색은 URL discovery만 담당합니다. 광범위 검색 + 국가유산/박물관
-        #    도메인 검색을 함께 해 공식 원문을 찾을 확률을 높입니다.
-        search_queries = [
-            f"{short_subject} {query}",
-            f"site:khs.go.kr {short_subject} {query}",
-            f"site:gyeongju.museum.go.kr {short_subject} {query}",
-            f"site:museum.go.kr {short_subject} {query}",
-        ]
+        # 2) Daum 웹검색. 카카오 문서에 보장되지 않은 site: 연산자에 의존하지 않고
+        #    기관명을 검색어에 직접 넣습니다. 첫 검색은 질문 자체를 살려 의도(피장자 등)를
+        #    보존하고, 이후 검색은 국립경주박물관/국가유산청 등 공식기관명으로 보강합니다.
+        search_queries: list[str] = []
+
+        def add_query(value: str) -> None:
+            value = re.sub(r"\s+", " ", value).strip()
+            if value and value not in search_queries:
+                search_queries.append(value)
+
+        for variant in variants[:3]:
+            if normalize_name(variant) in normalize_name(query):
+                add_query(query)
+            else:
+                add_query(f"{variant} {query}")
+            add_query(f"{variant} 국립경주박물관")
+            add_query(f"{variant} 국가유산청")
+            add_query(f"{variant} 국가유산포털")
+            add_query(f"{variant} 국립중앙박물관")
+
+        # 역사 질문에 자주 쓰이는 핵심 표현도 검색어에 보강합니다.
+        if any(token in query for token in ("누구", "무덤", "피장자", "주인")):
+            add_query(f"{variants[0]} 피장자 무덤 주인")
+        if any(token in query for token in ("언제", "시대", "만들", "조성")):
+            add_query(f"{variants[0]} 조성 시기 시대")
+
         documents: list[dict] = []
         seen_search_urls: set[str] = set()
-        for search_query in search_queries:
+        subject_keys = [normalize_name(value) for value in variants if normalize_name(value)]
+        query_tokens = [
+            token
+            for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query)
+            if token not in {"알려줘", "알려", "누구", "뭐야", "어디", "경주"}
+        ]
+
+        for search_query in search_queries[:12]:
             try:
                 found = await asyncio.wait_for(
-                    self.daum.web_documents(search_query, limit=12),
-                    timeout=4.0,
+                    self.daum.web_documents(search_query, limit=30),
+                    timeout=5.0,
                 )
             except (IntegrationError, asyncio.TimeoutError, ValueError):
                 continue
@@ -7553,29 +7660,30 @@ class RagService:
                 searchable = normalize_name(
                     f"{document.get('title', '')} {document.get('contents', '')}"
                 )
-                subject_key = normalize_name(short_subject)
-                query_tokens = [
-                    token
-                    for token in re.findall(r"[0-9A-Za-z가-힣]{2,}", query)
-                    if token not in {"알려줘", "알려", "누구", "뭐야", "어디", "경주"}
-                ]
                 score = 0
-                if subject_key and subject_key in searchable:
-                    score += 100
-                score += sum(5 for token in query_tokens if normalize_name(token) in searchable)
+                if any(key and key in searchable for key in subject_keys):
+                    score += 120
+                score += sum(6 for token in query_tokens if normalize_name(token) in searchable)
                 source_bonus = {
-                    "국가유산청": 40,
-                    "국가유산포털": 38,
-                    "국립문화유산연구원": 36,
-                    "국립경주박물관": 35,
-                    "국립중앙박물관": 34,
-                    "경주시": 28,
+                    "국립경주박물관": 55,
+                    "국가유산청": 50,
+                    "국가유산포털": 48,
+                    "국립문화유산연구원": 45,
+                    "국립중앙박물관": 42,
+                    "경주시": 30,
                     "대한민국 구석구석": 20,
                 }.get(source_name, 0)
-                documents.append({**document, "source_name": source_name, "_score": score + source_bonus})
+                documents.append({
+                    **document,
+                    "source_name": source_name,
+                    "_score": score + source_bonus,
+                })
 
         documents.sort(key=lambda item: int(item.get("_score") or 0), reverse=True)
-        fetch_candidates = [doc for doc in documents if str(doc.get("url") or "") not in seen_urls][:5]
+        fetch_candidates = [
+            doc for doc in documents
+            if str(doc.get("url") or "") not in seen_urls
+        ][:10]
 
         async def _fetch(document: dict):
             url = str(document.get("url") or "")
@@ -7584,9 +7692,9 @@ class RagService:
                     self.trusted_web.fetch_document(
                         url,
                         query=query,
-                        title=short_subject,
+                        title=variants[0],
                     ),
-                    timeout=5.0,
+                    timeout=6.0,
                 )
             except (IntegrationError, asyncio.TimeoutError, ValueError):
                 return None
@@ -7596,10 +7704,14 @@ class RagService:
                     result["title"] = f"{result.get('source_name', '공식 자료')} - {page_title}"
             return result
 
-        fetched = await asyncio.gather(
-            *(_fetch(document) for document in fetch_candidates),
-            return_exceptions=False,
-        ) if fetch_candidates else []
+        fetched = (
+            await asyncio.gather(
+                *(_fetch(document) for document in fetch_candidates),
+                return_exceptions=False,
+            )
+            if fetch_candidates
+            else []
+        )
 
         for context in fetched:
             if not context:
@@ -7609,6 +7721,29 @@ class RagService:
                 continue
             if url:
                 seen_urls.add(url)
+            contexts.append(context)
+            if len(contexts) >= 5:
+                return contexts[:5]
+
+        # 4) 일부 공공기관은 Railway에서 원문 fetch가 막히거나 첨부/뷰어 URL을
+        #    반환하기도 합니다. 이때 답을 포기하지 않고, 신뢰 도메인으로 검증된 Daum
+        #    웹검색 결과의 본문 요약만 최후 fallback으로 사용합니다.
+        for document in documents:
+            url = str(document.get("url") or "")
+            if not url or url in seen_urls:
+                continue
+            source_name = str(document.get("source_name") or "")
+            if not source_name:
+                continue
+            context = self._trusted_search_snippet_context(document, source_name)
+            if not context:
+                continue
+            searchable = normalize_name(
+                f"{context.get('title', '')} {context.get('overview', '')}"
+            )
+            if subject_keys and not any(key in searchable for key in subject_keys):
+                continue
+            seen_urls.add(url)
             contexts.append(context)
             if len(contexts) >= 5:
                 break
