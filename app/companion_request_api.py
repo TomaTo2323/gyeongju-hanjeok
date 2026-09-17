@@ -8,15 +8,17 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db import (
+from .auth_service import get_current_user
+from .db import (
     RouteCompanionRequestRecord,
     SharedRouteMemberRecord,
     SharedRouteRecord,
+    UserPublicProfileRecord,
     UserRecord,
     get_db,
 )
-from app.auth import get_current_user
-from app.notification_service import create_notification
+from .member_service import normalize_member_code
+from .notification_service import create_notification
 
 companion_router = APIRouter(tags=["shared-route-companion"])
 
@@ -35,10 +37,6 @@ class CompanionRequestResponse(BaseModel):
     created_at: datetime
 
 
-def _route_owner_id(route: SharedRouteRecord) -> str:
-    return route.owner_user_id
-
-
 def _response(db: Session, row: RouteCompanionRequestRecord) -> CompanionRequestResponse:
     requester = db.get(UserRecord, row.requester_user_id)
     return CompanionRequestResponse(
@@ -46,10 +44,14 @@ def _response(db: Session, row: RouteCompanionRequestRecord) -> CompanionRequest
         shared_route_id=row.shared_route_id,
         requester_user_id=row.requester_user_id,
         recipient_user_id=row.recipient_user_id,
-        requester_nickname=getattr(requester, "nickname", "경주한적 사용자"),
+        requester_nickname=requester.nickname if requester is not None else "경주한적 사용자",
         status=row.status,
         created_at=row.created_at,
     )
+
+
+def _route_user_key(shared_route_id: str, user_id: str) -> str:
+    return f"{shared_route_id}:{user_id}"
 
 
 @companion_router.post(
@@ -66,13 +68,18 @@ def request_companion(
     route = db.get(SharedRouteRecord, shared_route_id)
     if route is None:
         raise HTTPException(status_code=404, detail="공유 코스를 찾을 수 없습니다.")
-    if _route_owner_id(route) != current_user.user_id:
-        raise HTTPException(status_code=403, detail="코스 소유자만 동행을 요청할 수 있습니다.")
+    if route.owner_user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="코스를 만든 방장만 동행을 요청할 수 있습니다.")
 
-    member_code = body.member_code.strip().upper()
-    recipient = db.scalar(
-        select(UserRecord).where(UserRecord.member_code == member_code)
+    member_code = normalize_member_code(body.member_code)
+    profile = db.scalar(
+        select(UserPublicProfileRecord).where(
+            UserPublicProfileRecord.member_code == member_code
+        )
     )
+    if profile is None:
+        raise HTTPException(status_code=404, detail="해당 회원코드를 찾을 수 없습니다.")
+    recipient = db.get(UserRecord, profile.user_id)
     if recipient is None:
         raise HTTPException(status_code=404, detail="해당 회원을 찾을 수 없습니다.")
     if recipient.user_id == current_user.user_id:
@@ -104,8 +111,8 @@ def request_companion(
         user_id=recipient.user_id,
         actor_user_id=current_user.user_id,
         type="shared_route_invite",
-        title="새 동행 코스 요청",
-        message=f"{current_user.nickname}님이 함께 여행할 코스에 초대했어요.",
+        title="동행 코스 요청",
+        message=f"{current_user.nickname}님이 함께 여행할 코스로 초대했어요.",
         shared_route_id=shared_route_id,
         route_request_id=row.request_id,
     )
@@ -150,15 +157,27 @@ def accept_companion_request(
     if row.status != "pending":
         raise HTTPException(status_code=409, detail="이미 처리된 동행 요청입니다.")
 
-    # SharedRouteMemberRecord의 실제 PK/필드명에 맞춰 이 생성자만 확인하세요.
-    membership = SharedRouteMemberRecord(
-        membership_id=str(uuid4()),
-        shared_route_id=row.shared_route_id,
-        user_id=current_user.user_id,
-        role="editor",
-        joined_at=datetime.now(timezone.utc),
+    route = db.get(SharedRouteRecord, row.shared_route_id)
+    if route is None:
+        raise HTTPException(status_code=404, detail="공유 코스를 찾을 수 없습니다.")
+
+    route_user_key = _route_user_key(row.shared_route_id, current_user.user_id)
+    membership = db.scalar(
+        select(SharedRouteMemberRecord).where(
+            SharedRouteMemberRecord.route_user_key == route_user_key
+        )
     )
-    db.add(membership)
+    if membership is None:
+        db.add(
+            SharedRouteMemberRecord(
+                route_user_key=route_user_key,
+                shared_route_id=row.shared_route_id,
+                user_id=current_user.user_id,
+                role="editor",
+                added_by_user_id=row.requester_user_id,
+                joined_at=datetime.now(timezone.utc),
+            )
+        )
 
     row.status = "accepted"
     row.responded_at = datetime.now(timezone.utc)
