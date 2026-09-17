@@ -3646,7 +3646,14 @@ class OpenAIClient(BaseClient):
                 *history_messages,
                 {"role": "user", "content": f"질문: {query}\n\n참고 자료:\n{context_text}"},
             ],
+            "max_output_tokens": 300,
         }
+
+        # 검색/근거 선택은 그대로 두고 최종 문장 생성 단계만 저지연으로 설정합니다.
+        if str(self.settings.openai_model).lower().startswith("gpt-5"):
+            body["reasoning"] = {"effort": "minimal"}
+            body["text"] = {"verbosity": "low"}
+
         # RAG 컨텍스트(관광지+지식 문서)가 늘어날수록 모델이 답을 만드는 데 걸리는 시간도
         # 길어져서, 다른 API 호출에 쓰는 기본 20초 타임아웃으로는 가끔 502가 났다.
         # 이 호출만 넉넉하게 60초로 늘린다.
@@ -3656,7 +3663,19 @@ class OpenAIClient(BaseClient):
             json_body=body,
             headers=self.headers,
             timeout_seconds=60.0,
-)
+        )
+
+        usage = payload.get("usage") or {}
+        output_details = usage.get("output_tokens_details") or {}
+        print(
+            "RAG-TIMING stage=openai_usage "
+            f"model={self.settings.openai_model} "
+            f"input_tokens={usage.get('input_tokens', 0)} "
+            f"output_tokens={usage.get('output_tokens', 0)} "
+            f"reasoning_tokens={output_details.get('reasoning_tokens', 0)}",
+            flush=True,
+        )
+
         answer = _extract_openai_text(payload)
         # 원문 URL은 참고자료 UI에서 처리하므로 답변 본문에서는 제거합니다.
         answer = re.sub(r"(?m)^\s*[-•]?\s*https?://\S+\s*$", "", answer)
