@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import asyncio
 import random
@@ -20,6 +20,7 @@ from .clients import (
     KakaoLocalClient,
     NaverClient,
     OpenAIClient,
+    PhotoClient,
     RegionalVisitorClient,
     TourApiClient,
     WeatherClient,
@@ -63,6 +64,84 @@ _PLACE_LIST_OVERVIEW_CACHE: dict[
     str,
     tuple[float, str],
 ] = {}
+
+# 한국관광공사 관광사진 정보(PhotoGalleryService1)로 장소카드 이미지를
+# 보완합니다. 같은 장소를 반복 호출하지 않도록 성공/실패 결과 모두 캐시합니다.
+PLACE_PHOTO_GALLERY_CACHE_TTL_SECONDS = 6 * 60 * 60
+PLACE_PHOTO_GALLERY_NEGATIVE_CACHE_TTL_SECONDS = 30 * 60
+PLACE_PHOTO_GALLERY_CONCURRENCY = 4
+PLACE_PHOTO_GALLERY_TOTAL_TIMEOUT_SECONDS = 4.0
+PLACE_PHOTO_GALLERY_MAX_PER_RESPONSE = 8
+
+_PLACE_PHOTO_GALLERY_CACHE: dict[
+    str,
+    tuple[float, str | None, dict[str, Any] | None],
+] = {}
+
+GYEONGJU_MAP_POOL_CACHE_TTL_SECONDS = 30 * 60
+
+_GYEONGJU_MAP_POOL_CACHE: list[Place] = []
+_GYEONGJU_MAP_POOL_CACHE_AT: float = 0.0
+
+
+async def _gyeongju_map_pool(
+    settings: Settings,
+) -> list[Place]:
+    """
+    지도용 경주시 전체 장소 후보.
+
+    TourAPI locationBasedList의 20km 제한을 사용하지 않고
+    경주시 전체 areaBasedList를 한 번 받아 30분간 캐시합니다.
+
+    코스용 _gyeongju_route_pool과 달리
+    음식점/카페(contentTypeId=39)도 유지합니다.
+    """
+    global _GYEONGJU_MAP_POOL_CACHE
+    global _GYEONGJU_MAP_POOL_CACHE_AT
+
+    now = time.monotonic()
+
+    if (
+        _GYEONGJU_MAP_POOL_CACHE
+        and now - _GYEONGJU_MAP_POOL_CACHE_AT
+        < GYEONGJU_MAP_POOL_CACHE_TTL_SECONDS
+    ):
+        return [
+            place.model_copy(
+                deep=True
+            )
+            for place in _GYEONGJU_MAP_POOL_CACHE
+        ]
+
+    places = await TourApiClient(
+        settings
+    ).gyeongju_places(
+        limit=1000,
+    )
+
+    places = [
+        place
+        for place in places
+        if is_user_facing_travel_place(
+            place
+        )
+    ]
+
+    _GYEONGJU_MAP_POOL_CACHE = [
+        place.model_copy(
+            deep=True
+        )
+        for place in places
+    ]
+
+    _GYEONGJU_MAP_POOL_CACHE_AT = now
+
+    return [
+        place.model_copy(
+            deep=True
+        )
+        for place in places
+    ]
 
 async def _nearest_tourist_pool(
     settings: Settings,
@@ -202,16 +281,20 @@ DEBUG_CONGESTION_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 class FrontRecommendRequest(BaseModel):
-    # Live user GPS is never accepted by the backend.
+    # 사용자가 코스 만들기에서 선택한 실제 출발 좌표입니다.
+    # 좌표가 오지 않는 구버전 요청은 경주 기본 좌표로 안전하게 fallback 합니다.
+    start_latitude: float = Field(
+        default=DEFAULT_LATITUDE,
+        ge=-90,
+        le=90,
+    )
+    start_longitude: float = Field(
+        default=DEFAULT_LONGITUDE,
+        ge=-180,
+        le=180,
+    )
+
     available_hours: float = Field(default=4, gt=0, le=24)
-
-    @property
-    def start_latitude(self) -> float:
-        return DEFAULT_LATITUDE
-
-    @property
-    def start_longitude(self) -> float:
-        return DEFAULT_LONGITUDE
     transport_type: str = "car"
     radius_km: float = Field(default=15, gt=0, le=30)
     preferred_categories: list[str] = Field(default_factory=list)
@@ -221,6 +304,12 @@ class FrontRecommendRequest(BaseModel):
     expected_include: str = ""
     expected_exclude: str = ""
     memo: str = ""
+
+    # Flutter RoutePreferences에서 보내는 여행 날짜/시각.
+    # RecommendationService에는 하나의 timezone-aware datetime으로 전달합니다.
+    travel_date: str = ""
+    start_time: str = ""
+
     visited_place_ids: list[str] = Field(default_factory=list)
 
 
@@ -268,6 +357,83 @@ def _resolve_transport_mode(value: str) -> TransportMode:
         return TransportMode.public_transport
 
     return TransportMode.driving
+
+
+def _front_start_datetime(
+    body: FrontRecommendRequest,
+) -> datetime | None:
+    """Flutter의 YYYY-MM-DD / HH:mm 값을 한국 시간 datetime으로 변환합니다."""
+    date_text = body.travel_date.strip()
+    time_text = body.start_time.strip()
+
+    if not date_text and not time_text:
+        return None
+
+    kst = timezone(
+        timedelta(hours=9)
+    )
+    now = datetime.now(kst)
+
+    if not date_text:
+        date_text = now.strftime(
+            "%Y-%m-%d"
+        )
+
+    if not time_text:
+        time_text = now.strftime(
+            "%H:%M"
+        )
+
+    try:
+        parsed = datetime.fromisoformat(
+            f"{date_text}T{time_text}"
+        )
+    except ValueError:
+        # 잘못된 날짜/시각 때문에 코스 생성 전체를 실패시키지 않습니다.
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(
+            tzinfo=kst
+        )
+
+    return parsed.astimezone(kst)
+
+
+def _payload_coordinate(
+    body: dict[str, Any],
+    *,
+    snake_key: str,
+    camel_key: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw = body.get(
+        snake_key
+    )
+
+    if raw is None:
+        raw = body.get(
+            camel_key
+        )
+
+    try:
+        value = float(raw)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return default
+
+    if not (
+        minimum
+        <= value
+        <= maximum
+    ):
+        return default
+
+    return value
 
 
 def _memo_intents(value: str) -> list[str]:
@@ -633,6 +799,13 @@ def _to_backend_request(
     )
 
     return RecommendRequest(
+        # 출발 좌표는 후보 관광지 범위를 제한하는 용도가 아니라
+        # 첫 방문지/방문 순서/첫 이동거리·시간 계산의 기준점으로 사용합니다.
+        latitude=body.start_latitude,
+        longitude=body.start_longitude,
+        start_time=_front_start_datetime(
+            body
+        ),
         available_minutes=max(
             60,
             round(
@@ -640,7 +813,11 @@ def _to_backend_request(
             ),
         ),
         transport=transport,
+
+        # 관광 후보는 출발지 주변이 아니라 경주시 전체 풀을 사용합니다.
+        # RecommendationService의 _gyeongju_route_pool()과 함께 유지합니다.
         radius_km=30.0,
+
         preferences=preferences,
         weather_aware=body.weather_aware,
         include_rest_stops=body.include_rest_stops,
@@ -1850,6 +2027,298 @@ async def _fill_list_overviews_from_tourapi(
     return places
 
 
+def _photo_gallery_cache_key(place: Place) -> str:
+    return normalize_name(place.title or "")
+
+
+def _photo_gallery_cache_get(
+    place: Place,
+) -> tuple[str | None, dict[str, Any] | None] | None:
+    key = _photo_gallery_cache_key(place)
+    if not key:
+        return None
+
+    cached = _PLACE_PHOTO_GALLERY_CACHE.get(key)
+    if cached is None:
+        return None
+
+    cached_at, image_url, raw = cached
+    ttl_seconds = (
+        PLACE_PHOTO_GALLERY_CACHE_TTL_SECONDS
+        if image_url
+        else PLACE_PHOTO_GALLERY_NEGATIVE_CACHE_TTL_SECONDS
+    )
+
+    if (
+        time.monotonic() - cached_at
+        > ttl_seconds
+    ):
+        _PLACE_PHOTO_GALLERY_CACHE.pop(key, None)
+        return None
+
+    return image_url, raw
+
+
+def _photo_gallery_cache_set(
+    place: Place,
+    image_url: str | None,
+    raw: dict[str, Any] | None,
+) -> None:
+    key = _photo_gallery_cache_key(place)
+    if not key:
+        return
+
+    _PLACE_PHOTO_GALLERY_CACHE[key] = (
+        time.monotonic(),
+        image_url,
+        dict(raw) if isinstance(raw, dict) else None,
+    )
+
+
+def _photo_gallery_row_image_url(row: dict[str, Any]) -> str:
+    """관광사진 API 버전별 이미지 필드명을 안전하게 처리합니다."""
+    for key in (
+        "galWebImageUrl",
+        "galWebImageUrl1",
+        "imageUrl",
+        "imageURL",
+        "originImgUrl",
+        "firstimage",
+        "firstImage",
+    ):
+        value = str(row.get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+    return ""
+
+
+def _photo_gallery_row_title(row: dict[str, Any]) -> str:
+    return str(
+        row.get("galTitle")
+        or row.get("title")
+        or row.get("name")
+        or ""
+    ).strip()
+
+
+def _photo_gallery_row_matches_place(
+    place: Place,
+    row: dict[str, Any],
+) -> bool:
+    """
+    동명이인 관광사진이 잘못 붙는 것을 피하기 위해 장소명 일치를 우선합니다.
+    관광사진 제목/촬영장소/검색키워드 중 장소명이 직접 확인될 때만 사용합니다.
+    """
+    wanted = normalize_name(place.title or "")
+    if not wanted:
+        return False
+
+    title = normalize_name(_photo_gallery_row_title(row))
+    location = normalize_name(
+        str(row.get("galPhotographyLocation") or "")
+    )
+    keywords = normalize_name(
+        str(row.get("galSearchKeyword") or "")
+    )
+
+    # '경주 첨성대' ↔ '첨성대'처럼 경주 접두어 차이는 허용합니다.
+    aliases = _overview_place_aliases(place.title)
+
+    def matches(value: str) -> bool:
+        if not value:
+            return False
+        return any(
+            alias
+            and (
+                alias == value
+                or alias in value
+            )
+            for alias in aliases
+        )
+
+    return (
+        matches(title)
+        or matches(location)
+        or matches(keywords)
+    )
+
+
+def _pick_photo_gallery_row(
+    place: Place,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    usable = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and _photo_gallery_row_image_url(row)
+        and _photo_gallery_row_matches_place(place, row)
+    ]
+
+    if not usable:
+        return None
+
+    wanted = normalize_name(place.title or "")
+
+    def rank(row: dict[str, Any]) -> tuple[int, int]:
+        title = normalize_name(_photo_gallery_row_title(row))
+        if title == wanted:
+            title_rank = 0
+        elif wanted and wanted in title:
+            title_rank = 1
+        else:
+            title_rank = 2
+
+        # 경주 촬영지를 조금 더 우선합니다.
+        location = str(row.get("galPhotographyLocation") or "")
+        gyeongju_rank = 0 if "경주" in location else 1
+        return title_rank, gyeongju_rank
+
+    usable.sort(key=rank)
+    return usable[0]
+
+
+async def _fill_place_images_from_photo_gallery(
+    places: list[Place],
+    settings: Settings,
+    *,
+    max_places: int = PLACE_PHOTO_GALLERY_MAX_PER_RESPONSE,
+) -> list[Place]:
+    """
+    한국관광공사 관광사진 정보(PhotoGalleryService1/gallerySearchList1)를
+    실제 장소카드 이미지에 연결합니다.
+
+    - 관광지/문화시설/여행코스/레포츠 위주로 적용
+    - 맛집/카페(contentTypeId=39)는 음식 사진 오매칭을 피하기 위해 제외
+    - 한 응답에서 최대 8곳만 조회해 호출량을 제한
+    - 4개 동시 호출, 전체 최대 4초
+    - 사진 API 실패/무매칭 시 기존 KorService2 이미지를 그대로 유지
+    - 성공/실패 모두 6시간 캐시해 반복 호출을 줄임
+    """
+    if not places or max_places <= 0:
+        return places
+
+    candidates = [
+        place
+        for place in places
+        if str(place.content_type_id or "") != "39"
+        and _front_place_category(place) not in {"맛집", "카페"}
+    ][:max_places]
+
+    if not candidates:
+        return places
+
+    photo_client = PhotoClient(settings)
+    semaphore = asyncio.Semaphore(
+        PLACE_PHOTO_GALLERY_CONCURRENCY
+    )
+
+    async def fill_one(place: Place) -> None:
+        cached = _photo_gallery_cache_get(place)
+        if cached is not None:
+            cached_url, cached_raw = cached
+            if cached_url:
+                place.image_url = cached_url
+                raw = dict(place.raw or {})
+                raw["photo_gallery"] = cached_raw or {}
+                raw["image_source"] = "kto_photo_gallery"
+                place.raw = raw
+            return
+
+        try:
+            async with semaphore:
+                rows = await asyncio.wait_for(
+                    photo_client.search(
+                        place.title,
+                        limit=5,
+                    ),
+                    timeout=2.8,
+                )
+
+                # TourAPI 제목이 "경주 첨성대"처럼 지역명이 붙어 있어
+                # 관광사진 키워드 검색이 비는 경우 지역 접두어를 제거해
+                # 한 번만 추가 검색합니다.
+                if (
+                    not rows
+                    and place.title.strip().startswith("경주 ")
+                ):
+                    fallback_keyword = place.title.strip()[3:].strip()
+                    if fallback_keyword:
+                        rows = await asyncio.wait_for(
+                            photo_client.search(
+                                fallback_keyword,
+                                limit=5,
+                            ),
+                            timeout=2.8,
+                        )
+        except (asyncio.TimeoutError, IntegrationError, Exception):
+            _photo_gallery_cache_set(place, None, None)
+            return
+
+        matched = _pick_photo_gallery_row(place, rows)
+        if matched is None:
+            _photo_gallery_cache_set(place, None, None)
+            return
+
+        image_url = _photo_gallery_row_image_url(matched)
+        if not image_url:
+            _photo_gallery_cache_set(place, None, None)
+            return
+
+        # 관광사진 API가 실제로 일치한 경우에는 카드 대표사진으로 우선 사용.
+        # 실패/무매칭에서는 기존 KorService2 image_url/thumbnail_url을 유지합니다.
+        place.image_url = image_url
+
+        raw = dict(place.raw or {})
+        raw["photo_gallery"] = matched
+        raw["image_source"] = "kto_photo_gallery"
+        place.raw = raw
+
+        _photo_gallery_cache_set(
+            place,
+            image_url,
+            matched,
+        )
+
+    tasks = [
+        asyncio.create_task(fill_one(place))
+        for place in candidates
+    ]
+
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=PLACE_PHOTO_GALLERY_TOTAL_TIMEOUT_SECONDS,
+    )
+
+    for task in pending:
+        task.cancel()
+
+    if pending:
+        await asyncio.gather(
+            *pending,
+            return_exceptions=True,
+        )
+
+    applied = sum(
+        1
+        for place in candidates
+        if (
+            isinstance(place.raw, dict)
+            and place.raw.get("image_source") == "kto_photo_gallery"
+        )
+    )
+
+    print(
+        "[PHOTO GALLERY]",
+        f"candidates={len(candidates)}",
+        f"applied={applied}",
+        f"completed_tasks={len(done)}",
+        f"cancelled_tasks={len(pending)}",
+    )
+
+    return places
+
+
 def _operating_hours_card_label(value: str | None) -> str:
     """카드용 짧은 운영시간 라벨. 추천시간과 혼동되지 않게 운영정보만 사용."""
     text = re.sub(r"\s+", " ", value or "").strip()
@@ -2296,121 +2765,210 @@ async def _list_places(
     category: str,
     settings: Settings,
 ) -> list[dict[str, Any]]:
-    client = TourApiClient(settings)
+    client = TourApiClient(
+        settings
+    )
+
+    search_query = (
+        query.strip()
+    )
 
     try:
-        if query.strip():
-            search_query = query.strip()
-
-            # 1) 우선 기존 경주 지역필터 검색
+        # ==========================================================
+        # 1. 장소명 검색
+        # ==========================================================
+        if search_query:
             places = await client.keyword_search(
                 search_query,
-                limit=max(limit, 30),
+                limit=max(
+                    limit,
+                    30,
+                ),
             )
 
-            # 2) KorService2 지역필터 검색에서 유명 관광지가 누락되는 경우가 있어
-            #    결과가 없으면 전국 키워드 검색 후 경주 지역 결과만 남깁니다.
+            # 경주 지역검색에서 유명 관광지가 빠질 경우
+            # 전국검색 후 경주 결과만 남깁니다.
             if not places:
-                global_places = await client.keyword_search_global(
-                    search_query,
-                    limit=max(limit, 50),
+                global_places = (
+                    await client.keyword_search_global(
+                        search_query,
+                        limit=max(
+                            limit,
+                            50,
+                        ),
+                    )
                 )
 
-                gyeongju_places: list[Place] = []
+                gyeongju_places: list[
+                    Place
+                ] = []
 
                 for place in global_places:
-                    address = (place.address or "").strip()
+                    address = (
+                        place.address
+                        or ""
+                    ).strip()
 
-                    # 주소에 경주가 명시되어 있으면 가장 확실하게 허용
                     if "경주" in address:
-                        gyeongju_places.append(place)
+                        gyeongju_places.append(
+                            place
+                        )
                         continue
 
-                    # 주소 정보가 약한 데이터는 경주 중심 반경 50km 이내인지 확인
                     try:
-                        distance_from_gyeongju = haversine_km(
-                            DEFAULT_LATITUDE,
-                            DEFAULT_LONGITUDE,
-                            place.latitude,
-                            place.longitude,
+                        distance_from_gyeongju = (
+                            haversine_km(
+                                DEFAULT_LATITUDE,
+                                DEFAULT_LONGITUDE,
+                                place.latitude,
+                                place.longitude,
+                            )
                         )
                     except Exception:
                         continue
 
-                    if distance_from_gyeongju <= 50.0:
-                        gyeongju_places.append(place)
+                    if (
+                        distance_from_gyeongju
+                        <= 50.0
+                    ):
+                        gyeongju_places.append(
+                            place
+                        )
 
                 places = gyeongju_places
 
-            # 3) 그래도 없으면 "경주 + 검색어" 형태도 한 번 시도합니다.
-            if not places and not search_query.startswith("경주"):
-                places = await client.keyword_search_global(
-                    f"경주 {search_query}",
-                    limit=max(limit, 50),
+            # "경주 + 장소명"도 한 번 더 검색
+            if (
+                not places
+                and not search_query.startswith(
+                    "경주"
+                )
+            ):
+                places = (
+                    await client.keyword_search_global(
+                        f"경주 {search_query}",
+                        limit=max(
+                            limit,
+                            50,
+                        ),
+                    )
                 )
 
-                places = [
-                    place
-                    for place in places
-                    if (
-                        "경주" in (place.address or "")
-                        or haversine_km(
-                            DEFAULT_LATITUDE,
-                            DEFAULT_LONGITUDE,
-                            place.latitude,
-                            place.longitude,
-                        ) <= 50.0
+                gyeongju_places = []
+
+                for place in places:
+                    address = (
+                        place.address
+                        or ""
                     )
-                ]
 
-            # 4) 검색 결과는 정확한 장소명에 가까운 순서로 우선 정렬
-            normalized_query = normalize_name(search_query)
+                    if "경주" in address:
+                        gyeongju_places.append(
+                            place
+                        )
+                        continue
 
-            def search_rank(place: Place) -> tuple[int, int]:
-                normalized_title = normalize_name(place.title)
+                    try:
+                        distance_from_gyeongju = (
+                            haversine_km(
+                                DEFAULT_LATITUDE,
+                                DEFAULT_LONGITUDE,
+                                place.latitude,
+                                place.longitude,
+                            )
+                        )
+                    except Exception:
+                        continue
 
-                if normalized_title == normalized_query:
+                    if (
+                        distance_from_gyeongju
+                        <= 50.0
+                    ):
+                        gyeongju_places.append(
+                            place
+                        )
+
+                places = gyeongju_places
+
+            # 검색 정확도 순 정렬
+            normalized_query = (
+                normalize_name(
+                    search_query
+                )
+            )
+
+            def search_rank(
+                place: Place,
+            ) -> tuple[int, int]:
+                normalized_title = (
+                    normalize_name(
+                        place.title
+                    )
+                )
+
+                if (
+                    normalized_title
+                    == normalized_query
+                ):
                     match_rank = 0
-                elif normalized_query in normalized_title:
+
+                elif (
+                    normalized_query
+                    in normalized_title
+                ):
                     match_rank = 1
-                elif normalized_title in normalized_query:
+
+                elif (
+                    normalized_title
+                    in normalized_query
+                ):
                     match_rank = 2
+
                 else:
                     match_rank = 3
 
                 return (
                     match_rank,
-                    abs(len(normalized_title) - len(normalized_query)),
+                    abs(
+                        len(
+                            normalized_title
+                        )
+                        - len(
+                            normalized_query
+                        )
+                    ),
                 )
 
-            places.sort(key=search_rank)
-            places = places[:limit]
-        else:
-            # 홈 카테고리 필터는 조회 후 세부 분류를 판별하므로
-            # 최초 후보를 충분히 가져와야 특정 카테고리가 0건으로
-            # 보이는 문제를 줄일 수 있습니다.
-            nearby_limit = (
-                max(limit, 60)
-                if category and category != "전체"
-                else limit
+            places.sort(
+                key=search_rank
             )
 
-            places = await client.nearby_places(
-                latitude,
-                longitude,
-                int(radius_km * 1000),
-                nearby_limit,
+        # ==========================================================
+        # 2. 일반 지도 조회
+        # ==========================================================
+        else:
+            # locationBasedList의 20km API 제한을 쓰지 않습니다.
+            #
+            # 경주시 전체 장소를 캐시에서 가져온 뒤
+            # 현재 '지도 화면 중심'과 각 장소의 실제 거리를 계산합니다.
+            places = await _gyeongju_map_pool(
+                settings
             )
 
     except IntegrationError as exc:
         raise HTTPException(
             exc.status_code,
             detail={
-                "service": exc.service,
-                "message": str(exc),
+                "service":
+                    exc.service,
+                "message":
+                    str(exc),
             },
         ) from exc
 
+    # ==============================================================
+    # 3. 현재 지도 중심으로부터 거리 계산
+    # ==============================================================
     for place in places:
         place.distance_km = round(
             haversine_km(
@@ -2422,14 +2980,43 @@ async def _list_places(
             3,
         )
 
-    # 홈/지도/검색에는 실제 여행 목적지와 음식점/카페만 노출합니다.
+    # ==============================================================
+    # 4. 사용자에게 실제로 보여줄 수 있는 장소만 유지
+    # ==============================================================
     places = [
         place
         for place in places
-        if is_user_facing_travel_place(place)
+        if is_user_facing_travel_place(
+            place
+        )
     ]
 
-    if category and category != "전체":
+    # ==============================================================
+    # 5. 지도 일반 조회일 때만 현재 화면 중심 반경 적용
+    # ==============================================================
+    #
+    # 검색에서는 예를 들어 지도 중심이 황리단길이어도
+    # "불국사"를 검색하면 불국사가 나와야 하므로
+    # 검색 결과에는 이 반경 제한을 적용하지 않습니다.
+    if not search_query:
+        places = [
+            place
+            for place in places
+            if (
+                place.distance_km
+                is not None
+                and place.distance_km
+                <= radius_km
+            )
+        ]
+
+    # ==============================================================
+    # 6. 홈/지도 카테고리 필터
+    # ==============================================================
+    if (
+        category
+        and category != "전체"
+    ):
         places = [
             place
             for place in places
@@ -2439,16 +3026,54 @@ async def _list_places(
             )
         ]
 
-        # 사용자 화면에는 요청한 limit까지만 반환합니다.
-        places = places[:limit]
+    # ==============================================================
+    # 7. 반환 후보 개수 제한
+    # ==============================================================
+    if search_query:
+        # 검색 결과는 장소명 정확도 순서 유지
+        places = places[
+            :limit
+        ]
 
-    # 장소카드 소개가 비어 있는 관광지만 TourAPI 공식 상세정보의 overview로
-    # 가볍게 보완합니다. 기능 로직/혼잡도 계산/정렬은 기존 그대로 유지합니다.
-    places = await _fill_list_overviews_from_tourapi(
+    else:
+        # 지도는 현재 화면 중심에서 가까운 장소부터 후보를 고릅니다.
+        #
+        # 이후 혼잡도순으로 다시 표시하더라도
+        # 후보 자체는 현재 보고 있는 지도 주변 장소여야 합니다.
+        places.sort(
+            key=lambda place: (
+                place.distance_km
+                if place.distance_km
+                is not None
+                else 9999.0
+            )
+        )
+
+        places = places[
+            :limit
+        ]
+
+    # ==============================================================
+    # 8. TourAPI 공식 소개문 보완
+    # ==============================================================
+    places = (
+        await _fill_list_overviews_from_tourapi(
+            places,
+            settings,
+        )
+    )
+
+    # ==============================================================
+    # 9. 한국관광공사 관광사진 정보로 장소카드 이미지 보완
+    # ==============================================================
+    places = await _fill_place_images_from_photo_gallery(
         places,
         settings,
     )
 
+    # ==============================================================
+    # 10. 기존 경주한적 V2 혼잡도 계산
+    # ==============================================================
     places = await _enrich_congestion(
         places,
         settings,
@@ -2456,19 +3081,29 @@ async def _list_places(
         longitude=longitude,
     )
 
-    places.sort(
-        key=lambda place: (
-            place.congestion_score
-            if place.congestion_score is not None
-            else 101.0
+    # 지도 기본 목록에서는 가까운 후보를 고른 뒤
+    # 한적한 장소를 우선 표시합니다.
+    #
+    # 검색에서는 "불국사" 검색 결과가 혼잡도 때문에
+    # 뒤로 밀리지 않도록 검색 정확도 순서를 유지합니다.
+    if not search_query:
+        places.sort(
+            key=lambda place: (
+                place.congestion_score
+                if (
+                    place.congestion_score
+                    is not None
+                )
+                else 101.0
+            )
         )
-    )
 
     return [
-        _place_to_front(place)
+        _place_to_front(
+            place
+        )
         for place in places
     ]
-
 
 
 @compat_router.get("/debug/congestion-v2")
@@ -2778,14 +3413,34 @@ async def debug_congestion_v2(
 async def front_places(
     query: str = "",
     category: str = "",
-    radius_km: float = Query(15, gt=0, le=20),
-    limit: int = Query(30, ge=1, le=100),
-    settings: Settings = Depends(get_settings),
+    latitude: float = Query(
+        DEFAULT_LATITUDE,
+        ge=-90,
+        le=90,
+    ),
+    longitude: float = Query(
+        DEFAULT_LONGITUDE,
+        ge=-180,
+        le=180,
+    ),
+    radius_km: float = Query(
+        20,
+        gt=0,
+        le=30,
+    ),
+    limit: int = Query(
+        30,
+        ge=1,
+        le=100,
+    ),
+    settings: Settings = Depends(
+        get_settings
+    ),
 ):
     return {
         "places": await _list_places(
-            latitude=DEFAULT_LATITUDE,
-            longitude=DEFAULT_LONGITUDE,
+            latitude=latitude,
+            longitude=longitude,
             radius_km=radius_km,
             limit=limit,
             query=query,
@@ -3076,6 +3731,14 @@ async def _load_place_detail_core(
         place.title = (
             seed.title.strip()
         )
+
+    # 장소 상세 상단 이미지도 같은 관광사진 캐시/매칭 규칙을 사용합니다.
+    # 실패하면 TourAPI(KorService2)의 기존 대표 이미지를 그대로 유지합니다.
+    await _fill_place_images_from_photo_gallery(
+        [place],
+        settings,
+        max_places=1,
+    )
 
     # Kakao Local은 전화/주소/상세 URL 보조.
     if kakao_task is not None:
@@ -3859,9 +4522,24 @@ async def front_replace_stop(
             or ""
         ).strip()
 
-        # User GPS is not accepted. The server uses only the fixed Gyeongju anchor.
-        start_latitude = DEFAULT_LATITUDE
-        start_longitude = DEFAULT_LONGITUDE
+        # 장소 교체 후 첫 구간을 다시 계산할 때도
+        # 사용자가 처음 선택한 실제 출발 좌표를 그대로 사용합니다.
+        start_latitude = _payload_coordinate(
+            body,
+            snake_key="start_latitude",
+            camel_key="startLatitude",
+            default=DEFAULT_LATITUDE,
+            minimum=-90,
+            maximum=90,
+        )
+        start_longitude = _payload_coordinate(
+            body,
+            snake_key="start_longitude",
+            camel_key="startLongitude",
+            default=DEFAULT_LONGITUDE,
+            minimum=-180,
+            maximum=180,
+        )
 
         transport_raw = str(
             body.get("transport_type")
