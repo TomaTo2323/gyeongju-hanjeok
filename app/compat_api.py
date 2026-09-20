@@ -75,7 +75,7 @@ PLACE_PHOTO_GALLERY_MAX_PER_RESPONSE = 8
 
 _PLACE_PHOTO_GALLERY_CACHE: dict[
     str,
-    tuple[float, str | None, dict[str, Any] | None],
+    tuple[float, list[str], list[dict[str, Any]]],
 ] = {}
 
 GYEONGJU_MAP_POOL_CACHE_TTL_SECONDS = 30 * 60
@@ -2033,7 +2033,7 @@ def _photo_gallery_cache_key(place: Place) -> str:
 
 def _photo_gallery_cache_get(
     place: Place,
-) -> tuple[str | None, dict[str, Any] | None] | None:
+) -> tuple[list[str], list[dict[str, Any]]] | None:
     key = _photo_gallery_cache_key(place)
     if not key:
         return None
@@ -2042,10 +2042,10 @@ def _photo_gallery_cache_get(
     if cached is None:
         return None
 
-    cached_at, image_url, raw = cached
+    cached_at, image_urls, rows = cached
     ttl_seconds = (
         PLACE_PHOTO_GALLERY_CACHE_TTL_SECONDS
-        if image_url
+        if image_urls
         else PLACE_PHOTO_GALLERY_NEGATIVE_CACHE_TTL_SECONDS
     )
 
@@ -2056,13 +2056,13 @@ def _photo_gallery_cache_get(
         _PLACE_PHOTO_GALLERY_CACHE.pop(key, None)
         return None
 
-    return image_url, raw
+    return list(image_urls), [dict(row) for row in rows]
 
 
 def _photo_gallery_cache_set(
     place: Place,
-    image_url: str | None,
-    raw: dict[str, Any] | None,
+    image_urls: list[str],
+    rows: list[dict[str, Any]],
 ) -> None:
     key = _photo_gallery_cache_key(place)
     if not key:
@@ -2070,8 +2070,8 @@ def _photo_gallery_cache_set(
 
     _PLACE_PHOTO_GALLERY_CACHE[key] = (
         time.monotonic(),
-        image_url,
-        dict(raw) if isinstance(raw, dict) else None,
+        list(image_urls),
+        [dict(row) for row in rows if isinstance(row, dict)],
     )
 
 
@@ -2121,7 +2121,6 @@ def _photo_gallery_row_matches_place(
         str(row.get("galSearchKeyword") or "")
     )
 
-    # '경주 첨성대' ↔ '첨성대'처럼 경주 접두어 차이는 허용합니다.
     aliases = _overview_place_aliases(place.title)
 
     def matches(value: str) -> bool:
@@ -2143,10 +2142,13 @@ def _photo_gallery_row_matches_place(
     )
 
 
-def _pick_photo_gallery_row(
+def _pick_photo_gallery_rows(
     place: Place,
     rows: list[dict[str, Any]],
-) -> dict[str, Any] | None:
+    *,
+    max_images: int = 5,
+) -> list[dict[str, Any]]:
+    """장소와 일치하는 관광사진을 우선순위대로 최대 5장 고릅니다."""
     usable = [
         row
         for row in rows
@@ -2156,26 +2158,67 @@ def _pick_photo_gallery_row(
     ]
 
     if not usable:
-        return None
+        return []
 
     wanted = normalize_name(place.title or "")
 
-    def rank(row: dict[str, Any]) -> tuple[int, int]:
+    def rank(row: dict[str, Any]) -> tuple[int, int, int]:
         title = normalize_name(_photo_gallery_row_title(row))
-        if title == wanted:
+        aliases = _overview_place_aliases(place.title)
+
+        if title == wanted or title in aliases:
             title_rank = 0
-        elif wanted and wanted in title:
+        elif any(alias and alias in title for alias in aliases):
             title_rank = 1
         else:
             title_rank = 2
 
-        # 경주 촬영지를 조금 더 우선합니다.
         location = str(row.get("galPhotographyLocation") or "")
         gyeongju_rank = 0 if "경주" in location else 1
-        return title_rank, gyeongju_rank
+
+        # 제목이 짧고 정확한 사진을 조금 더 앞에 둡니다.
+        return title_rank, gyeongju_rank, len(title)
 
     usable.sort(key=rank)
-    return usable[0]
+
+    selected: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for row in usable:
+        image_url = _photo_gallery_row_image_url(row)
+        if not image_url or image_url in seen_urls:
+            continue
+        seen_urls.add(image_url)
+        selected.append(row)
+        if len(selected) >= max_images:
+            break
+
+    return selected
+
+
+def _apply_photo_gallery_rows(
+    place: Place,
+    rows: list[dict[str, Any]],
+) -> None:
+    image_urls = [
+        _photo_gallery_row_image_url(row)
+        for row in rows
+        if _photo_gallery_row_image_url(row)
+    ]
+    image_urls = list(dict.fromkeys(image_urls))[:5]
+
+    if not image_urls:
+        return
+
+    # 작은 장소카드는 첫 장을 대표 이미지로 그대로 사용합니다.
+    place.image_url = image_urls[0]
+
+    raw = dict(place.raw or {})
+    raw["photo_gallery"] = rows[0] if rows else {}
+    raw["photo_gallery_rows"] = [dict(row) for row in rows]
+    raw["photo_gallery_images"] = image_urls
+    raw["image_source"] = "kto_photo_gallery"
+    place.raw = raw
 
 
 async def _fill_place_images_from_photo_gallery(
@@ -2186,14 +2229,15 @@ async def _fill_place_images_from_photo_gallery(
 ) -> list[Place]:
     """
     한국관광공사 관광사진 정보(PhotoGalleryService1/gallerySearchList1)를
-    실제 장소카드 이미지에 연결합니다.
+    장소카드 대표사진 + 상세화면 사진 갤러리에 연결합니다.
 
-    - 관광지/문화시설/여행코스/레포츠 위주로 적용
-    - 맛집/카페(contentTypeId=39)는 음식 사진 오매칭을 피하기 위해 제외
-    - 한 응답에서 최대 8곳만 조회해 호출량을 제한
+    - 장소별로 일치하는 사진을 최대 5장 보관
+    - 장소카드에서는 첫 장만 대표 이미지로 사용
+    - 상세 API에서는 image_urls 배열을 함께 반환
+    - 맛집/카페(contentTypeId=39)는 오매칭 방지를 위해 제외
+    - 한 응답에서 최대 8개 장소만 조회
     - 4개 동시 호출, 전체 최대 4초
-    - 사진 API 실패/무매칭 시 기존 KorService2 이미지를 그대로 유지
-    - 성공/실패 모두 6시간 캐시해 반복 호출을 줄임
+    - 관광사진 API 실패/무매칭 시 기존 KorService2 이미지를 유지
     """
     if not places or max_places <= 0:
         return places
@@ -2216,13 +2260,9 @@ async def _fill_place_images_from_photo_gallery(
     async def fill_one(place: Place) -> None:
         cached = _photo_gallery_cache_get(place)
         if cached is not None:
-            cached_url, cached_raw = cached
-            if cached_url:
-                place.image_url = cached_url
-                raw = dict(place.raw or {})
-                raw["photo_gallery"] = cached_raw or {}
-                raw["image_source"] = "kto_photo_gallery"
-                place.raw = raw
+            cached_urls, cached_rows = cached
+            if cached_urls:
+                _apply_photo_gallery_rows(place, cached_rows)
             return
 
         try:
@@ -2230,54 +2270,56 @@ async def _fill_place_images_from_photo_gallery(
                 rows = await asyncio.wait_for(
                     photo_client.search(
                         place.title,
-                        limit=5,
+                        limit=10,
                     ),
                     timeout=2.8,
                 )
 
-                # TourAPI 제목이 "경주 첨성대"처럼 지역명이 붙어 있어
-                # 관광사진 키워드 검색이 비는 경우 지역 접두어를 제거해
-                # 한 번만 추가 검색합니다.
+                matched_rows = _pick_photo_gallery_rows(
+                    place,
+                    rows,
+                    max_images=5,
+                )
+
+                # '경주 첨성대'처럼 지역 접두어가 붙은 장소는
+                # 접두어를 제거한 검색 결과도 합쳐 최대 5장을 확보합니다.
                 if (
-                    not rows
+                    len(matched_rows) < 5
                     and place.title.strip().startswith("경주 ")
                 ):
                     fallback_keyword = place.title.strip()[3:].strip()
                     if fallback_keyword:
-                        rows = await asyncio.wait_for(
+                        fallback_rows = await asyncio.wait_for(
                             photo_client.search(
                                 fallback_keyword,
-                                limit=5,
+                                limit=10,
                             ),
                             timeout=2.8,
                         )
+                        matched_rows = _pick_photo_gallery_rows(
+                            place,
+                            [*rows, *fallback_rows],
+                            max_images=5,
+                        )
         except (asyncio.TimeoutError, IntegrationError, Exception):
-            _photo_gallery_cache_set(place, None, None)
+            _photo_gallery_cache_set(place, [], [])
             return
 
-        matched = _pick_photo_gallery_row(place, rows)
-        if matched is None:
-            _photo_gallery_cache_set(place, None, None)
+        if not matched_rows:
+            _photo_gallery_cache_set(place, [], [])
             return
 
-        image_url = _photo_gallery_row_image_url(matched)
-        if not image_url:
-            _photo_gallery_cache_set(place, None, None)
-            return
+        image_urls = [
+            _photo_gallery_row_image_url(row)
+            for row in matched_rows
+        ]
+        image_urls = [url for url in image_urls if url]
 
-        # 관광사진 API가 실제로 일치한 경우에는 카드 대표사진으로 우선 사용.
-        # 실패/무매칭에서는 기존 KorService2 image_url/thumbnail_url을 유지합니다.
-        place.image_url = image_url
-
-        raw = dict(place.raw or {})
-        raw["photo_gallery"] = matched
-        raw["image_source"] = "kto_photo_gallery"
-        place.raw = raw
-
+        _apply_photo_gallery_rows(place, matched_rows)
         _photo_gallery_cache_set(
             place,
-            image_url,
-            matched,
+            image_urls,
+            matched_rows,
         )
 
     tasks = [
@@ -2308,16 +2350,57 @@ async def _fill_place_images_from_photo_gallery(
         )
     )
 
+    photo_count = sum(
+        len(
+            place.raw.get("photo_gallery_images", [])
+            if isinstance(place.raw, dict)
+            else []
+        )
+        for place in candidates
+    )
+
     print(
         "[PHOTO GALLERY]",
         f"candidates={len(candidates)}",
         f"applied={applied}",
+        f"photos={photo_count}",
         f"completed_tasks={len(done)}",
         f"cancelled_tasks={len(pending)}",
     )
 
     return places
 
+
+def _front_image_urls(place: Place) -> list[str]:
+    """프론트 상세 갤러리용 이미지 목록. 대표 이미지는 항상 첫 번째입니다."""
+    raw = place.raw if isinstance(place.raw, dict) else {}
+    gallery = raw.get("photo_gallery_images")
+
+    candidates: list[str] = []
+
+    if isinstance(gallery, list):
+        candidates.extend(
+            str(value).strip()
+            for value in gallery
+            if str(value).strip()
+        )
+
+    candidates.extend(
+        value
+        for value in (
+            str(place.image_url or "").strip(),
+            str(place.thumbnail_url or "").strip(),
+        )
+        if value
+    )
+
+    return list(
+        dict.fromkeys(
+            value
+            for value in candidates
+            if value.startswith(("http://", "https://"))
+        )
+    )[:5]
 
 def _operating_hours_card_label(value: str | None) -> str:
     """카드용 짧은 운영시간 라벨. 추천시간과 혼동되지 않게 운영정보만 사용."""
@@ -2346,6 +2429,8 @@ def _operating_hours_card_label(value: str | None) -> str:
 
 
 def _place_to_front(place: Place) -> dict[str, Any]:
+    image_urls = _front_image_urls(place)
+
     return {
         "id": place.place_id,
         "place_id": place.place_id,
@@ -2375,7 +2460,8 @@ def _place_to_front(place: Place) -> dict[str, Any]:
         # description과 같은 값을 overview 별칭으로도 내려 디버깅/구버전
         # 프론트 호환성을 높입니다. 신규 Flutter는 description을 사용합니다.
         "overview": _front_overview_text(place),
-        "image_url": place.image_url or place.thumbnail_url or "",
+        "image_url": image_urls[0] if image_urls else "",
+        "image_urls": image_urls,
         "distance_km": place.distance_km or 0,
         "recommended_time": recommended_time_label(
             place
