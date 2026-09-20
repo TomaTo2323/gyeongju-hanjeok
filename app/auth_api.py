@@ -79,6 +79,7 @@ class ConsentResponse(BaseModel):
 
 class UserResponse(BaseModel):
     user_id: str
+    role: str = "user"
     member_code: str
     email: str
     nickname: str
@@ -114,6 +115,7 @@ def _user_response(db: Session, user: UserRecord) -> UserResponse:
     public_profile = ensure_public_profile(db, user)
     return UserResponse(
         user_id=user.user_id,
+        role=user.role,
         member_code=public_profile.member_code,
         email=user.email,
         nickname=user.nickname,

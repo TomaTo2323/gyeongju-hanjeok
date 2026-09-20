@@ -154,6 +154,18 @@ def get_current_user(
     return user
 
 
+
+def require_admin(
+    current_user: UserRecord = Depends(get_current_user),
+) -> UserRecord:
+    if getattr(current_user, "role", "user") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="관리자 권한이 필요합니다.",
+        )
+    return current_user
+
+
 def _b64encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
 
