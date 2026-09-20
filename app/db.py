@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine
+from sqlalchemy import LargeBinary
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import get_settings
@@ -403,6 +404,29 @@ class NotificationRecord(Base):
     read_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+
+
+class CommunityImageRecord(Base):
+    __tablename__ = "community_images"
+
+    image_id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid4()),
+    )
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        index=True,
+    )
+    original_name: Mapped[str] = mapped_column(String(255), default="community-image")
+    content_type: Mapped[str] = mapped_column(String(64))
+    image_bytes: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
     )
 
 
