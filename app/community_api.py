@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import base64
-import binascii
 from enum import StrEnum
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import String, delete, func, select
 from sqlalchemy.orm import Session
@@ -15,7 +12,6 @@ from sqlalchemy.orm import Session
 from .auth_service import get_current_user
 from .db import (
     CommunityCommentRecord,
-    CommunityImageRecord,
     CommunityPostRecord,
     CommunityPostReportRecord,
     CommunityPostHiddenRecord,
@@ -35,17 +31,6 @@ class CommunityPostType(StrEnum):
     course = "course"
     live = "live"
     travel = "travel"
-
-
-class CommunityImageUpload(BaseModel):
-    file_name: str = Field(default="community-image", max_length=255)
-    mime_type: str = Field(max_length=64)
-    data_base64: str = Field(min_length=1)
-
-
-class CommunityImageUploadResponse(BaseModel):
-    image_id: str
-    image_url: str
 
 
 class AuthorResponse(BaseModel):
@@ -465,73 +450,6 @@ def _default_title(db: Session, body: CommunityPostCreate, course_snapshot: dict
             return f"{title} 코스 후기"
         return "다녀온 코스 후기"
     return body.content.strip()[:30]
-
-
-@community_router.post(
-    "/images",
-    response_model=CommunityImageUploadResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def upload_community_image(
-    body: CommunityImageUpload,
-    current_user: UserRecord = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    allowed_types = {"image/jpeg", "image/png", "image/webp"}
-    mime_type = body.mime_type.strip().lower()
-    if mime_type not in allowed_types:
-        raise HTTPException(
-            status_code=415,
-            detail="JPG, PNG, WEBP 이미지만 첨부할 수 있습니다.",
-        )
-
-    try:
-        image_bytes = base64.b64decode(body.data_base64, validate=True)
-    except (ValueError, binascii.Error):
-        raise HTTPException(status_code=422, detail="사진 데이터 형식이 올바르지 않습니다.")
-
-    if not image_bytes:
-        raise HTTPException(status_code=422, detail="빈 사진은 첨부할 수 없습니다.")
-
-    # DB 저장 방식은 Railway 재배포 후에도 사진이 사라지지 않도록 하기 위한
-    # 경량 운영 방식입니다. 커뮤니티 규모가 커지면 Object Storage로 이전할 수 있습니다.
-    max_bytes = 6 * 1024 * 1024
-    if len(image_bytes) > max_bytes:
-        raise HTTPException(status_code=413, detail="사진은 6MB 이하만 첨부할 수 있습니다.")
-
-    image = CommunityImageRecord(
-        owner_user_id=current_user.user_id,
-        original_name=body.file_name.strip() or "community-image",
-        content_type=mime_type,
-        image_bytes=image_bytes,
-    )
-    db.add(image)
-    db.commit()
-    db.refresh(image)
-
-    return CommunityImageUploadResponse(
-        image_id=image.image_id,
-        image_url=f"/community/images/{image.image_id}",
-    )
-
-
-@community_router.get("/images/{image_id}", name="get_community_image")
-def get_community_image(
-    image_id: str,
-    db: Session = Depends(get_db),
-):
-    image = db.get(CommunityImageRecord, image_id)
-    if image is None:
-        raise HTTPException(status_code=404, detail="사진을 찾을 수 없습니다.")
-
-    return Response(
-        content=image.image_bytes,
-        media_type=image.content_type,
-        headers={
-            "Cache-Control": "public, max-age=86400",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
 
 
 @community_router.post("/posts", response_model=CommunityPostResponse, status_code=status.HTTP_201_CREATED)

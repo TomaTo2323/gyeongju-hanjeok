@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, LargeBinary, String, create_engine
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import get_settings
@@ -60,7 +60,6 @@ class UserRecord(Base):
     password_hash: Mapped[str] = mapped_column(String(512))
     nickname: Mapped[str] = mapped_column(String(40))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    role: Mapped[str] = mapped_column(String(20), default="user", index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -312,6 +311,8 @@ class SharedRouteInviteRecord(Base):
     )
 
 
+
+
 class RouteCompanionRequestRecord(Base):
     __tablename__ = "route_companion_requests"
 
@@ -335,11 +336,7 @@ class RouteCompanionRequestRecord(Base):
         ForeignKey("users.user_id", ondelete="CASCADE"),
         index=True,
     )
-    status: Mapped[str] = mapped_column(
-        String(20),
-        default="pending",
-        index=True,
-    )
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -372,11 +369,31 @@ class NotificationRecord(Base):
     )
     type: Mapped[str] = mapped_column(String(64), index=True)
     title: Mapped[str] = mapped_column(String(160))
-    message: Mapped[str] = mapped_column(String(500), default="")
-    post_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    friendship_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    shared_route_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    route_request_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    message: Mapped[str] = mapped_column(String(1000))
+    post_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("community_posts.post_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    friendship_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("friendships.friendship_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    shared_route_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("shared_routes.shared_route_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    route_request_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("route_companion_requests.request_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     is_read: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -386,29 +403,6 @@ class NotificationRecord(Base):
     read_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
-    )
-
-
-class CommunityImageRecord(Base):
-    __tablename__ = "community_images"
-
-    image_id: Mapped[str] = mapped_column(
-        String(36),
-        primary_key=True,
-        default=lambda: str(uuid4()),
-    )
-    owner_user_id: Mapped[str] = mapped_column(
-        String(36),
-        ForeignKey("users.user_id", ondelete="CASCADE"),
-        index=True,
-    )
-    original_name: Mapped[str] = mapped_column(String(255), default="community-image")
-    content_type: Mapped[str] = mapped_column(String(64))
-    image_bytes: Mapped[bytes] = mapped_column(LargeBinary)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        index=True,
     )
 
 
@@ -565,26 +559,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
-
-    # 기존 DB의 users 테이블에는 create_all만으로 새 컬럼이 추가되지 않으므로
-    # 관리자 권한 컬럼을 안전하게 보정합니다.
-    from sqlalchemy import inspect, text
-
-    inspector = inspect(engine)
-    if "users" not in inspector.get_table_names():
-        return
-
-    columns = {column["name"] for column in inspector.get_columns("users")}
-    if "role" not in columns:
-        with engine.begin() as connection:
-            connection.execute(
-                text("ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT 'user'")
-            )
-
-    with engine.begin() as connection:
-        connection.execute(
-            text("UPDATE users SET role = 'user' WHERE role IS NULL OR role = ''")
-        )
+    _ensure_user_role_column()
 
 
 def get_db():
@@ -593,3 +568,33 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _ensure_user_role_column() -> None:
+    inspector = inspect(engine)
+
+    if "users" not in inspector.get_table_names():
+        return
+
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("users")
+    }
+
+    if "role" not in columns:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE users "
+                    "ADD COLUMN role VARCHAR(20) DEFAULT 'user'"
+                )
+            )
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE users "
+                "SET role = 'user' "
+                "WHERE role IS NULL OR role = ''"
+            )
+        )
