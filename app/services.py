@@ -4,7 +4,7 @@ import asyncio
 import math
 import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from urllib.parse import urlparse
 
@@ -262,9 +262,6 @@ PREFERENCE_KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
     "야경": (
         "야경", "월정교", "동궁", "월지", "첨성대", "보문", "야간", "빛",
-    ),
-    "행사": (
-        "축제", "행사", "공연", "페스티벌", "이벤트", "문화행사",
     ),
     "체험": (
         "체험", "공방", "마을", "전통", "한복", "레포츠",
@@ -1348,7 +1345,6 @@ def _progressive_route_individual(
         if (
             preference.strip().lower()
             not in FOOD_PREFERENCES
-            and preference.strip().lower() != "행사"
         )
     ]
 
@@ -2374,20 +2370,6 @@ def recommended_stay_minutes(
         or ""
     )
 
-    # 행사는 공식 종료시각이 있으면 실제 지속시간을 우선하고,
-    # 시간이 없으면 코스 내부 계산용으로만 90분을 사용합니다.
-    if content_type_id == "15":
-        if place.event_start_time and place.event_end_time:
-            start_min = _clock_text_to_minutes(place.event_start_time)
-            end_min = _clock_text_to_minutes(place.event_end_time)
-            if (
-                start_min is not None
-                and end_min is not None
-                and end_min > start_min
-            ):
-                return max(30, min(180, end_min - start_min))
-        return 90
-
     # 여행코스 자체는 짧은 단일 관광지보다 오래 머무는 편.
     if content_type_id == "25":
         return 120
@@ -2936,398 +2918,6 @@ async def _gyeongju_route_pool(
     return cleaned
 
 
-# ---------------------------------------------------------------------------
-# 행사/축제 후보 캐시 및 시간 메타데이터
-# ---------------------------------------------------------------------------
-
-_FESTIVAL_ROUTE_CACHE: dict[str, tuple[float, list[Place]]] = {}
-_FESTIVAL_ROUTE_TTL_SECONDS = 30 * 60
-
-
-def _event_clock_pair(text: str | None) -> tuple[str | None, str | None, str]:
-    """TourAPI playtime/운영시간 원문에서 확인 가능한 시각만 추출합니다.
-
-    반환 type:
-      fixed    - 단일 시작시각 또는 공연/개막/시작 의미가 명시된 시간
-      flexible - 운영시간 범위로 보이는 시간대
-      unknown  - 시각을 확인할 수 없음
-
-    날짜만 있는 행사는 시간을 만들어내지 않습니다. ``18시~20시``와
-    ``18:00~20:00``처럼 실제 원문에 있는 시각 표현만 정규화합니다.
-    """
-    raw = re.sub(r"\s+", " ", text or "").strip()
-    if not raw:
-        return None, None, "unknown"
-
-    def korean_clock(match: re.Match[str]) -> str:
-        hour = int(match.group(1))
-        minute = int(match.group(2) or 0)
-        return f"{hour:02d}:{minute:02d}"
-
-    normalized = re.sub(
-        r"(?<!\d)([01]?\d|2[0-3])\s*시(?:\s*([0-5]?\d)\s*분)?",
-        korean_clock,
-        raw,
-    )
-
-    range_match = re.search(
-        r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)"
-        r"\s*(?:~|[-–—]|부터)\s*"
-        r"([01]?\d|2[0-3]):([0-5]\d)",
-        normalized,
-    )
-
-    if range_match:
-        sh = int(range_match.group(1))
-        sm = int(range_match.group(2))
-        eh = int(range_match.group(3))
-        em = int(range_match.group(4))
-        start_text = f"{sh:02d}:{sm:02d}"
-        end_text = f"{eh:02d}:{em:02d}"
-        fixed_hint = any(
-            token in raw
-            for token in (
-                "공연시간", "공연 시간", "공연시작", "공연 시작",
-                "개막", "시작시간", "시작 시간", "상영",
-            )
-        )
-        return start_text, end_text, "fixed" if fixed_hint else "flexible"
-
-    single = re.search(
-        r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)",
-        normalized,
-    )
-    if single:
-        hour = int(single.group(1))
-        minute = int(single.group(2))
-        return f"{hour:02d}:{minute:02d}", None, "fixed"
-
-    return None, None, "unknown"
-
-def _prepare_event_place(place: Place) -> Place:
-    copied = place.model_copy(deep=True)
-    start_time, end_time, time_type = _event_clock_pair(
-        copied.operating_hours
-    )
-    copied.event_start_time = copied.event_start_time or start_time
-    copied.event_end_time = copied.event_end_time or end_time
-    copied.event_time_type = copied.event_time_type or time_type
-    copied.source = copied.source or "KTO_TOUR_API"
-    return copied
-
-
-def _event_anchor_datetime(
-    place: Place,
-    travel_day: date,
-    *,
-    end: bool = False,
-) -> datetime | None:
-    value = place.event_end_time if end else place.event_start_time
-    if not value:
-        return None
-    parsed = _clock_text_to_minutes(value)
-    if parsed is None:
-        return None
-    return datetime(
-        travel_day.year,
-        travel_day.month,
-        travel_day.day,
-        parsed // 60,
-        parsed % 60,
-        tzinfo=KST,
-    )
-
-
-async def _gyeongju_festival_pool(
-    tour: TourApiClient,
-    travel_day: date,
-) -> list[Place]:
-    """여행 날짜의 경주 행사 후보를 캐시 우선으로 조회합니다.
-
-    TourAPI 장애/429가 발생했을 때 같은 날짜의 이전 성공 캐시가 있으면
-    stale cache를 사용하고, 없으면 호출자에게 IntegrationError를 전달합니다.
-    """
-    key = travel_day.isoformat()
-    now = time.monotonic()
-    cached = _FESTIVAL_ROUTE_CACHE.get(key)
-
-    if cached is not None:
-        cached_at, places = cached
-        if now - cached_at < _FESTIVAL_ROUTE_TTL_SECONDS:
-            return [place.model_copy(deep=True) for place in places]
-
-    stale_places = cached[1] if cached is not None else []
-
-    try:
-        summaries = await tour.search_festivals(
-            travel_day,
-            limit=30,
-        )
-    except IntegrationError:
-        if stale_places:
-            return [place.model_copy(deep=True) for place in stale_places]
-        raise
-
-    # 시간/행사장/요금이 필요한 상위 후보만 상세조회합니다.
-    # 실패하면 summary를 그대로 사용하여 가짜 시간을 생성하지 않습니다.
-    async def detail_one(place: Place) -> Place:
-        try:
-            detailed = await asyncio.wait_for(
-                tour.detail(place),
-                timeout=2.8,
-            )
-            return _prepare_event_place(detailed)
-        except (IntegrationError, asyncio.TimeoutError, Exception):
-            return _prepare_event_place(place)
-
-    detailed_head = await asyncio.gather(
-        *(detail_one(place) for place in summaries[:6])
-    ) if summaries else []
-
-    by_id: dict[str, Place] = {
-        place.place_id: place
-        for place in detailed_head
-    }
-
-    places = [
-        by_id.get(place.place_id, _prepare_event_place(place))
-        for place in summaries
-    ]
-
-    # 동일 contentId 중복 제거
-    deduped = list({place.place_id: place for place in places}.values())
-
-    _FESTIVAL_ROUTE_CACHE[key] = (
-        now,
-        [place.model_copy(deep=True) for place in deduped],
-    )
-
-    return deduped
-
-
-def _event_candidate_score(
-    event: Place,
-    route: list[Place],
-    req: RecommendRequest,
-    start: datetime,
-) -> float:
-    if req.free_only and event.is_free is False:
-        return -1_000_000.0
-
-    route_distance = min(
-        (
-            haversine_km(
-                event.latitude,
-                event.longitude,
-                place.latitude,
-                place.longitude,
-            )
-            for place in route
-        ),
-        default=haversine_km(
-            req.latitude,
-            req.longitude,
-            event.latitude,
-            event.longitude,
-        ),
-    )
-
-    # 도보는 먼 행사를 강하게 감점하고 자동차는 더 넓게 허용합니다.
-    distance_penalty = route_distance * {
-        TransportMode.walking: 16.0,
-        TransportMode.public_transport: 8.0,
-        TransportMode.driving: 4.0,
-    }.get(req.transport, 8.0)
-
-    score = 100.0 - distance_penalty
-
-    fixed_start = _event_anchor_datetime(
-        event,
-        start.date(),
-    )
-    window_end = _event_anchor_datetime(
-        event,
-        start.date(),
-        end=True,
-    )
-
-    trip_end = start + timedelta(minutes=req.available_minutes)
-
-    if fixed_start is not None:
-        if event.event_time_type == "fixed" and fixed_start < start:
-            return -1_000_000.0
-        if fixed_start > trip_end:
-            return -1_000_000.0
-
-        if event.event_time_type == "fixed":
-            # 종료시각까지 확인된 고정 행사는 전체 행사시간이 사용자의
-            # 여행 가능시간 안에 들어오는 경우만 후보로 둡니다.
-            if window_end is not None and window_end > trip_end:
-                return -1_000_000.0
-
-            if window_end is None:
-                internal_end = fixed_start + timedelta(
-                    minutes=recommended_stay_minutes(event)
-                )
-                if internal_end > trip_end:
-                    return -1_000_000.0
-
-        score += 18.0
-
-    if window_end is not None and window_end <= start:
-        return -1_000_000.0
-
-    if event.event_time_type == "flexible":
-        visit_start = max(
-            start,
-            fixed_start or start,
-        )
-        visit_end_limit = min(
-            trip_end,
-            window_end or trip_end,
-        )
-        if (
-            visit_start
-            + timedelta(
-                minutes=min(
-                    60,
-                    max(
-                        30,
-                        recommended_stay_minutes(event),
-                    ),
-                )
-            )
-            > visit_end_limit
-        ):
-            return -1_000_000.0
-
-    if event.is_free is True:
-        score += 4.0
-
-    return score
-
-
-def _event_insertion_index(
-    route: list[Place],
-    event: Place,
-    req: RecommendRequest,
-    start: datetime,
-) -> int | None:
-    if not route:
-        return 0
-
-    anchor = _event_anchor_datetime(
-        event,
-        start.date(),
-    )
-    window_end = _event_anchor_datetime(
-        event,
-        start.date(),
-        end=True,
-    )
-    fixed = event.event_time_type == "fixed" and anchor is not None
-
-    best: tuple[float, int] | None = None
-
-    for insert_at in range(0, len(route) + 1):
-        test_route = [*route]
-        test_route.insert(insert_at, event)
-        current = start
-        previous = (req.latitude, req.longitude)
-        event_arrival: datetime | None = None
-
-        for place in test_route:
-            km = haversine_km(
-                previous[0],
-                previous[1],
-                place.latitude,
-                place.longitude,
-            )
-            current += timedelta(
-                minutes=_estimate_minutes(km, req.transport)
-            )
-
-            if place.place_id == event.place_id:
-                event_arrival = current
-                break
-
-            current += timedelta(
-                minutes=recommended_stay_minutes(place)
-            )
-            previous = (place.latitude, place.longitude)
-
-        if event_arrival is None:
-            continue
-
-        # 고정 시작 행사는 15분 전까지 도착 가능한 경우만 허용합니다.
-        if fixed:
-            latest = anchor - timedelta(minutes=15)
-            if event_arrival > latest:
-                continue
-
-            trip_end = start + timedelta(
-                minutes=req.available_minutes
-            )
-            if window_end is not None:
-                if window_end > trip_end:
-                    continue
-            elif (
-                anchor
-                + timedelta(
-                    minutes=recommended_stay_minutes(event)
-                )
-                > trip_end
-            ):
-                continue
-
-            wait_minutes = max(
-                0.0,
-                (anchor - event_arrival).total_seconds() / 60.0,
-            )
-            time_penalty = wait_minutes * 0.25
-        else:
-            # 운영시간 범위는 그 안에서 방문 가능한 위치만 허용합니다.
-            if window_end is not None:
-                minimum_stay = min(60, recommended_stay_minutes(event))
-                if event_arrival + timedelta(minutes=minimum_stay) > window_end:
-                    continue
-            if anchor is not None and event_arrival < anchor:
-                time_penalty = (
-                    anchor - event_arrival
-                ).total_seconds() / 60.0 * 0.08
-            else:
-                time_penalty = 0.0
-
-        prev_coord = (
-            (req.latitude, req.longitude)
-            if insert_at == 0
-            else (route[insert_at - 1].latitude, route[insert_at - 1].longitude)
-        )
-        next_place = route[insert_at] if insert_at < len(route) else None
-        detour = haversine_km(
-            prev_coord[0], prev_coord[1], event.latitude, event.longitude
-        )
-        if next_place is not None:
-            detour += haversine_km(
-                event.latitude, event.longitude,
-                next_place.latitude, next_place.longitude,
-            )
-            detour -= haversine_km(
-                prev_coord[0], prev_coord[1],
-                next_place.latitude, next_place.longitude,
-            )
-
-        position_penalty = abs(
-            insert_at / max(1, len(route)) - 0.68
-        ) * 6.0
-        score = detour * 8.0 + time_penalty + position_penalty
-
-        if best is None or score < best[0]:
-            best = (score, insert_at)
-
-    return None if best is None else best[1]
-
-
 class RecommendationService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -3359,28 +2949,6 @@ class RecommendationService:
             req.start_time
             or datetime.now(KST)
         ).astimezone(KST)
-
-        event_requested = any(
-            value.strip() == "행사"
-            for value in req.preferences
-        )
-        event_candidates: list[Place] = []
-        event_lookup_failed = False
-
-        if event_requested:
-            try:
-                event_candidates = await asyncio.wait_for(
-                    _gyeongju_festival_pool(
-                        self.tour,
-                        start.date(),
-                    ),
-                    timeout=5.5,
-                )
-            except (IntegrationError, asyncio.TimeoutError):
-                event_lookup_failed = True
-                if "festival_api" not in unavailable:
-                    unavailable.append("festival_api")
-                event_candidates = []
 
         # 1. 경주시 전체 관광지 후보 풀
         # 출발지 주변 locationBasedList 결과에 의존하지 않습니다.
@@ -3951,20 +3519,6 @@ class RecommendationService:
             weather,
         )
 
-        if event_requested:
-            if event_candidates:
-                applied.append(
-                    f"{start.date().isoformat()} 진행 행사 후보 {len(event_candidates)}건 확인"
-                )
-            elif event_lookup_failed:
-                applied.append(
-                    "행사 API 확인 실패: 기존 관광지 코스로 fallback"
-                )
-            else:
-                applied.append(
-                    "선택한 날짜에 이용 가능한 행사 없음: 기존 테마 중심 fallback"
-                )
-
         attraction_candidates = [
             place
             for place in candidates
@@ -4395,7 +3949,6 @@ class RecommendationService:
                 unavailable,
                 food_candidates=food_candidates,
                 cafe_candidates=cafe_candidates,
-                event_candidates=event_candidates,
             )
 
             courses.append(course)
@@ -5033,7 +4586,6 @@ class RecommendationService:
         *,
         food_candidates: list[Place] | None = None,
         cafe_candidates: list[Place] | None = None,
-        event_candidates: list[Place] | None = None,
     ) -> Course:
         route = [
             places[index].model_copy(deep=True)
@@ -5060,44 +4612,6 @@ class RecommendationService:
                 *day_places,
                 *night_places,
             ]
-
-        event_candidates = event_candidates or []
-        chosen_event: Place | None = None
-        event_requested = any(
-            value.strip() == "행사"
-            for value in req.preferences
-        )
-
-        if event_requested and event_candidates:
-            ranked_events = sorted(
-                event_candidates,
-                key=lambda event: _event_candidate_score(
-                    event, route, req, start
-                ),
-                reverse=True,
-            )
-
-            for event in ranked_events:
-                if _event_candidate_score(
-                    event, route, req, start
-                ) < -1000:
-                    continue
-
-                insert_at = _event_insertion_index(
-                    route,
-                    event,
-                    req,
-                    start,
-                )
-                if insert_at is None:
-                    continue
-
-                chosen_event = event.model_copy(deep=True)
-                chosen_event.category = "축제·공연"
-                chosen_event.raw = dict(chosen_event.raw or {})
-                chosen_event.raw["route_event_anchor"] = True
-                route.insert(insert_at, chosen_event)
-                break
 
         food_candidates = food_candidates or []
         cafe_candidates = cafe_candidates or []
@@ -5640,207 +5154,12 @@ class RecommendationService:
                     "fallback": True,
                 }
 
-        async def resolve_route_segments(
-            target_route: list[Place],
-        ) -> list[dict[str, Any]]:
-            specs: list[
-                tuple[tuple[float, float], Place]
-            ] = []
-            previous = (
-                req.latitude,
-                req.longitude,
+        segment_results = await asyncio.gather(
+            *(
+                resolve_segment(origin, place)
+                for origin, place in segment_specs
             )
-
-            for target in target_route:
-                specs.append(
-                    (
-                        previous,
-                        target,
-                    )
-                )
-                previous = (
-                    target.latitude,
-                    target.longitude,
-                )
-
-            return await asyncio.gather(
-                *(
-                    resolve_segment(origin, target)
-                    for origin, target in specs
-                )
-            )
-
-        segment_results = await resolve_route_segments(
-            route
         )
-
-        # -----------------------------------------------------------
-        # 실제 Kakao 이동시간으로 행사 시간 앵커를 다시 검증합니다.
-        # 음식점/카페 삽입 이후 실제 이동시간이 예상보다 늘어날 수 있으므로
-        # 고정 행사 시작 15분 전 도착 조건을 충족할 때까지 행사 직전의
-        # 선택 장소를 하나씩 줄입니다. 꼭 포함 장소는 제거하지 않습니다.
-        # 더 이상 줄일 수 없으면 행사 자체를 빼고 일반 코스로 fallback합니다.
-        # -----------------------------------------------------------
-        for _ in range(4):
-            if not route or not segment_results:
-                break
-
-            trial_stays = _fit_itinerary_stays(
-                route,
-                available_minutes=req.available_minutes,
-                travel_minutes=sum(
-                    int(segment["travel_minutes"])
-                    for segment in segment_results
-                ),
-            )
-
-            trial_time = start
-            conflicting_event_index: int | None = None
-
-            for trial_index, (
-                trial_place,
-                trial_segment,
-                trial_stay,
-            ) in enumerate(
-                zip(
-                    route,
-                    segment_results,
-                    trial_stays,
-                )
-            ):
-                trial_time += timedelta(
-                    minutes=int(
-                        trial_segment["travel_minutes"]
-                    )
-                )
-
-                if str(
-                    trial_place.content_type_id
-                    or ""
-                ) == "15":
-                    event_start = _event_anchor_datetime(
-                        trial_place,
-                        start.date(),
-                    )
-                    event_end = _event_anchor_datetime(
-                        trial_place,
-                        start.date(),
-                        end=True,
-                    )
-
-                    if (
-                        trial_place.event_time_type == "fixed"
-                        and event_start is not None
-                    ):
-                        latest_arrival = (
-                            event_start
-                            - timedelta(minutes=15)
-                        )
-                        if trial_time > latest_arrival:
-                            conflicting_event_index = (
-                                trial_index
-                            )
-                            break
-                        if trial_time < event_start:
-                            trial_time = event_start
-
-                    elif (
-                        trial_place.event_time_type
-                        == "flexible"
-                    ):
-                        if (
-                            event_start is not None
-                            and trial_time < event_start
-                        ):
-                            trial_time = event_start
-
-                        if event_end is not None:
-                            minimum_visit = min(
-                                60,
-                                max(
-                                    30,
-                                    trial_stay,
-                                ),
-                            )
-                            if (
-                                trial_time
-                                + timedelta(
-                                    minutes=minimum_visit
-                                )
-                                > event_end
-                            ):
-                                conflicting_event_index = (
-                                    trial_index
-                                )
-                                break
-
-                trial_time += timedelta(
-                    minutes=trial_stay
-                )
-
-            if conflicting_event_index is None:
-                break
-
-            removable_index: int | None = None
-
-            for candidate_index in range(
-                conflicting_event_index - 1,
-                -1,
-                -1,
-            ):
-                candidate = route[
-                    candidate_index
-                ]
-                raw = (
-                    candidate.raw
-                    if isinstance(
-                        candidate.raw,
-                        dict,
-                    )
-                    else {}
-                )
-
-                if raw.get(
-                    "required_route_target"
-                ):
-                    continue
-
-                if str(
-                    candidate.content_type_id
-                    or ""
-                ) == "15":
-                    continue
-
-                removable_index = (
-                    candidate_index
-                )
-                break
-
-            if removable_index is None:
-                removed = route.pop(
-                    conflicting_event_index
-                )
-                print(
-                    "[EVENT ANCHOR FALLBACK]"
-                    f" event={removed.title!r}"
-                    " reason=actual_route_time_conflict"
-                )
-                chosen_event = None
-            else:
-                removed = route.pop(
-                    removable_index
-                )
-                print(
-                    "[EVENT ANCHOR ADJUST]"
-                    f" removed={removed.title!r}"
-                    " reason=protect_event_start"
-                )
-
-            segment_results = (
-                await resolve_route_segments(
-                    route
-                )
-            )
 
         print(
             "[ROUTE SEGMENTS]",
@@ -5914,60 +5233,6 @@ class RecommendationService:
                 minutes=travel_minutes
             )
 
-            if str(place.content_type_id or "") == "15":
-                event_start = _event_anchor_datetime(
-                    place,
-                    start.date(),
-                )
-                event_end = _event_anchor_datetime(
-                    place,
-                    start.date(),
-                    end=True,
-                )
-
-                # fixed 행사는 실제 시작시각보다 일찍 도착하면 기다렸다가 시작합니다.
-                if (
-                    place.event_time_type == "fixed"
-                    and event_start is not None
-                    and current_time < event_start
-                ):
-                    current_time = event_start
-
-                # flexible 운영시간도 시작 전이면 운영 시작까지 기다릴 수 있습니다.
-                elif (
-                    place.event_time_type == "flexible"
-                    and event_start is not None
-                    and current_time < event_start
-                ):
-                    current_time = event_start
-
-                if (
-                    event_end is not None
-                    and current_time >= event_end
-                ):
-                    # 이 경우는 사전 삽입 검증을 통과하기 어려우나,
-                    # 실제 길찾기 결과가 크게 늘어난 경우 경고를 남기기 위해
-                    # raw에 표시합니다. 가짜 시간으로 보정하지 않습니다.
-                    place.raw = dict(place.raw or {})
-                    place.raw["event_time_conflict"] = True
-
-            if str(place.content_type_id or "") == "15":
-                event_start = _event_anchor_datetime(place, start.date())
-                event_end = _event_anchor_datetime(place, start.date(), end=True)
-                if (
-                    place.event_time_type == "fixed"
-                    and event_start is not None
-                    and event_end is not None
-                    and event_end > event_start
-                ):
-                    place_stay = max(
-                        30,
-                        min(
-                            180,
-                            round((event_end - event_start).total_seconds() / 60),
-                        ),
-                    )
-
             result_places.append(
                 CoursePlace(
                     **place.model_dump(),
@@ -5997,12 +5262,10 @@ class RecommendationService:
             )
             total_distance_m += distance_m
 
-        total_minutes = max(
-            0,
-            round(
-                (current_time - start).total_seconds()
-                / 60
-            ),
+        total_minutes = sum(
+            place.travel_minutes_from_previous
+            + place.stay_minutes
+            for place in result_places
         )
 
         labels = {
@@ -6085,26 +5348,6 @@ class RecommendationService:
             warnings.append("요청한 맛집 후보를 현재 동선 주변에서 찾지 못했습니다.")
         if req.include_cafe and not has_cafe_stop:
             warnings.append("요청한 카페 후보를 현재 동선 주변에서 찾지 못했습니다.")
-
-        has_event_stop = any(
-            str(place.content_type_id or "") == "15"
-            for place in result_places
-        )
-
-        if event_requested and not has_event_stop:
-            warnings.append(
-                "선택한 날짜와 이동 조건에 맞는 행사를 넣기 어려워 다른 선호 테마 중심으로 구성했어요."
-            )
-
-        for event_place in result_places:
-            if (
-                str(event_place.content_type_id or "") == "15"
-                and isinstance(event_place.raw, dict)
-                and event_place.raw.get("event_time_conflict")
-            ):
-                warnings.append(
-                    f"{event_place.title}은 실제 이동시간에 따라 행사 종료 전 도착이 어려울 수 있어 확인이 필요합니다."
-                )
 
         for service_place in result_places:
             if (
@@ -8212,118 +7455,345 @@ class RagService:
     ) -> RagSearchResponse:
         history = history or []
 
-        # 의미검색에는 직전 사용자 발화를 보강해 지시어("그거", "거기") 문맥을 살립니다.
+        # -----------------------------------------------------------
+        # 1. 이전 대화 문맥 보강
+        # -----------------------------------------------------------
+        # "거기", "그거" 같은 후속 질문을 위해
+        # 가장 최근 사용자 발화를 의미검색 문장에 함께 사용합니다.
         last_user_turn = next(
-            (turn.content for turn in reversed(history) if turn.role == "user"),
+            (
+                turn.content
+                for turn in reversed(history)
+                if turn.role == "user"
+            ),
             None,
         )
-        search_text = f"{last_user_turn}\n{query}" if last_user_turn else query
 
-        # 장소명 탐지는 embedding보다 먼저 수행합니다. embedding이 아직 없는 레코드도
-        # 운영시간/요금 같은 정형 질문에는 사용할 수 있습니다.
-        all_place_records = list(self.db.scalars(select(PlaceRecord)).all())
-        exact_place = self._resolve_exact_place(query, history, all_place_records)
-        structured_fields = self._structured_fields(query)
+        search_text = (
+            f"{last_user_turn}\n{query}"
+            if last_user_turn
+            else query
+        )
 
-        if exact_place is not None and structured_fields:
-            exact_place = await self._refresh_place_record(exact_place, structured_fields)
-            answer, grounded = self._structured_answer(exact_place, structured_fields)
-            return RagSearchResponse(
-                query=query,
-                answer=answer,
-                hits=[self._place_hit(exact_place, 1.0)],
-                grounded=grounded,
-            )
-
-        vector = (await self.openai.embeddings([search_text]))[0]
-
-        place_records = [record for record in all_place_records if record.embedding]
-        doc_records = list(
+        # -----------------------------------------------------------
+        # 2. 장소명과 구조화 질문을 먼저 처리
+        # -----------------------------------------------------------
+        # 운영시간·휴무일·요금·주차 등은
+        # 일반 OpenAI 지식보다 관광공사/경주시 공식정보를 우선합니다.
+        all_place_records = list(
             self.db.scalars(
-                select(KnowledgeDocument).where(KnowledgeDocument.embedding.is_not(None))
+                select(PlaceRecord)
             ).all()
         )
 
-        if not place_records and not doc_records and exact_place is None:
-            raise ValueError(
-                "RAG 인덱스가 없습니다. 먼저 POST /api/v1/admin/sync를 실행하세요."
+        exact_place = self._resolve_exact_place(
+            query,
+            history,
+            all_place_records,
+        )
+
+        structured_fields = self._structured_fields(
+            query
+        )
+
+        if (
+            exact_place is not None
+            and structured_fields
+        ):
+            exact_place = (
+                await self._refresh_place_record(
+                    exact_place,
+                    structured_fields,
+                )
             )
 
-        exact_aliases = self._place_aliases(exact_place.title) if exact_place is not None else []
+            answer, grounded = (
+                self._structured_answer(
+                    exact_place,
+                    structured_fields,
+                )
+            )
 
-        def place_score(record: PlaceRecord) -> float:
-            score = _cosine(vector, record.embedding or [])
-            if exact_place is not None and record.place_id == exact_place.place_id:
-                # 질문에 명시된 장소는 의미검색 오차로 밀리지 않도록 우선합니다.
-                score = max(score, 0.99)
-            return score
-
-        def doc_score(record: KnowledgeDocument) -> float:
-            score = _cosine(vector, record.embedding or [])
-            if exact_aliases:
-                searchable = normalize_name(f"{record.title} {record.text[:800]}")
-                if any(alias in searchable for alias in exact_aliases):
-                    score = max(score, 0.96)
-            return score
-
-        place_scored = sorted(
-            ((place_score(record), "place", record) for record in place_records),
-            key=lambda item: item[0],
-            reverse=True,
-        )
-
-        # exact 장소가 아직 embedding되지 않았더라도 일반 장소 질문에서는 컨텍스트에 포함합니다.
-        if exact_place is not None and all(
-            record.place_id != exact_place.place_id for _, _, record in place_scored
-        ):
-            place_scored.insert(0, (0.99, "place", exact_place))
-
-        doc_scored = sorted(
-            ((doc_score(record), "etiquette", record) for record in doc_records),
-            key=lambda item: item[0],
-            reverse=True,
-        )
-
-        # 지식문서 전체를 LLM에 넘기지 않습니다. 장소 top-k와 지식문서 상위 N개만 사용해
-        # 역사·접근성·예절 문서가 무관한 질문에 과도하게 섞이는 현상을 줄입니다.
-        knowledge_limit = max(3, min(6, top_k + 1))
-        selected = sorted(
-            place_scored[:top_k] + doc_scored[:knowledge_limit],
-            key=lambda item: item[0],
-            reverse=True,
-        )
-
-        if not selected or selected[0][0] < self.settings.rag_min_similarity:
             return RagSearchResponse(
                 query=query,
-                answer=(
-                    "질문과 관련해 확인할 수 있는 자료가 부족합니다. "
-                    "관광지명을 함께 알려주시면 다시 찾아볼게요."
-                ),
+                answer=answer,
+                hits=[
+                    self._place_hit(
+                        exact_place,
+                        1.0,
+                    )
+                ],
+                grounded=grounded,
+            )
+
+        # -----------------------------------------------------------
+        # 3. 현재 사용 가능한 RAG 인덱스 확인
+        # -----------------------------------------------------------
+        place_records = [
+            record
+            for record in all_place_records
+            if record.embedding
+        ]
+
+        doc_records = list(
+            self.db.scalars(
+                select(
+                    KnowledgeDocument
+                ).where(
+                    KnowledgeDocument.embedding.is_not(
+                        None
+                    )
+                )
+            ).all()
+        )
+
+        # -----------------------------------------------------------
+        # 4. RAG 자체가 비어 있다면 OpenAI 일반지식 fallback
+        # -----------------------------------------------------------
+        # 이전에는 여기서 422 오류를 냈지만,
+        # 이제 RAG 장애/미동기화 때문에 챗봇 전체가 막히지 않게 합니다.
+        #
+        # 단, 운영시간/요금 같은 최신 구조화 질문은
+        # 위 단계에서 이미 따로 처리되었습니다.
+        if (
+            not place_records
+            and not doc_records
+            and exact_place is None
+        ):
+            fallback_answer = (
+                await self.openai.answer_without_context(
+                    query,
+                    history=history,
+                )
+            )
+
+            return RagSearchResponse(
+                query=query,
+                answer=fallback_answer,
                 hits=[],
                 grounded=False,
             )
 
-        # 화면의 참고자료는 LLM에 넘긴 모든 문서가 아니라 실제 상위 자료만 보여줍니다.
-        display_pool = selected[:top_k]
+        # -----------------------------------------------------------
+        # 5. 질문 embedding 생성
+        # -----------------------------------------------------------
+        vectors = await self.openai.embeddings(
+            [search_text]
+        )
+
+        if not vectors:
+            fallback_answer = (
+                await self.openai.answer_without_context(
+                    query,
+                    history=history,
+                )
+            )
+
+            return RagSearchResponse(
+                query=query,
+                answer=fallback_answer,
+                hits=[],
+                grounded=False,
+            )
+
+        vector = vectors[0]
+
+        exact_aliases = (
+            self._place_aliases(
+                exact_place.title
+            )
+            if exact_place is not None
+            else []
+        )
+
+        # -----------------------------------------------------------
+        # 6. 장소 RAG 점수
+        # -----------------------------------------------------------
+        def place_score(
+            record: PlaceRecord,
+        ) -> float:
+            score = _cosine(
+                vector,
+                record.embedding or [],
+            )
+
+            if (
+                exact_place is not None
+                and record.place_id
+                == exact_place.place_id
+            ):
+                # 질문에서 장소명이 명확히 확인되었다면
+                # embedding 오차 때문에 해당 장소가 밀리지 않게 합니다.
+                score = max(
+                    score,
+                    0.99,
+                )
+
+            return score
+
+        # -----------------------------------------------------------
+        # 7. 지식문서 RAG 점수
+        # -----------------------------------------------------------
+        def doc_score(
+            record: KnowledgeDocument,
+        ) -> float:
+            score = _cosine(
+                vector,
+                record.embedding or [],
+            )
+
+            if exact_aliases:
+                searchable = normalize_name(
+                    f"{record.title} "
+                    f"{record.text[:800]}"
+                )
+
+                if any(
+                    alias in searchable
+                    for alias in exact_aliases
+                ):
+                    score = max(
+                        score,
+                        0.96,
+                    )
+
+            return score
+
+        place_scored = sorted(
+            (
+                (
+                    place_score(record),
+                    "place",
+                    record,
+                )
+                for record in place_records
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        # DB에는 장소가 있지만 아직 embedding이 없는 경우에도
+        # 질문에서 장소가 정확히 확인됐다면 RAG 컨텍스트로 넣습니다.
+        if (
+            exact_place is not None
+            and all(
+                record.place_id
+                != exact_place.place_id
+                for _, _, record
+                in place_scored
+            )
+        ):
+            place_scored.insert(
+                0,
+                (
+                    0.99,
+                    "place",
+                    exact_place,
+                ),
+            )
+
+        doc_scored = sorted(
+            (
+                (
+                    doc_score(record),
+                    "etiquette",
+                    record,
+                )
+                for record in doc_records
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        # -----------------------------------------------------------
+        # 8. LLM에 넘길 RAG 자료 제한
+        # -----------------------------------------------------------
+        # 모든 지식문서를 한꺼번에 넘기지 않고,
+        # 장소 top-k + 지식문서 상위 일부만 사용합니다.
+        knowledge_limit = max(
+            3,
+            min(
+                6,
+                top_k + 1,
+            ),
+        )
+
+        selected = sorted(
+            (
+                place_scored[:top_k]
+                + doc_scored[:knowledge_limit]
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        # -----------------------------------------------------------
+        # 9. RAG 유사도가 너무 낮으면 일반지식 fallback
+        # -----------------------------------------------------------
+        if (
+            not selected
+            or selected[0][0]
+            < self.settings.rag_min_similarity
+        ):
+            fallback_answer = (
+                await self.openai.answer_without_context(
+                    query,
+                    history=history,
+                )
+            )
+
+            return RagSearchResponse(
+                query=query,
+                answer=fallback_answer,
+                hits=[],
+                grounded=False,
+            )
+
+        # -----------------------------------------------------------
+        # 10. 사용자 화면에 보여줄 참고자료
+        # -----------------------------------------------------------
+        display_pool = selected[
+            :top_k
+        ]
 
         contexts: list[dict] = []
-        for _, source_type, record in selected:
+
+        for (
+            _,
+            source_type,
+            record,
+        ) in selected:
             if source_type == "place":
-                contexts.append(record.data or {})
+                contexts.append(
+                    record.data or {}
+                )
             else:
                 contexts.append(
                     {
-                        "title": record.title,
-                        "category": record.category,
-                        "overview": record.text,
+                        "title":
+                            record.title,
+                        "category":
+                            record.category,
+                        "overview":
+                            record.text,
                     }
                 )
 
         hits: list[RagHit] = []
-        for score, source_type, record in display_pool:
+
+        for (
+            score,
+            source_type,
+            record,
+        ) in display_pool:
             if source_type == "place":
-                hits.append(self._place_hit(record, score))
+                hits.append(
+                    self._place_hit(
+                        record,
+                        score,
+                    )
+                )
+
             else:
                 hits.append(
                     RagHit(
@@ -8331,17 +7801,52 @@ class RagService:
                         place_id=record.doc_id,
                         title=record.title,
                         category=record.category,
-                        similarity=round(score, 4),
+                        similarity=round(
+                            score,
+                            4,
+                        ),
                         overview=record.text,
                     )
                 )
 
-        answer = await self.openai.answer_with_context(query, contexts, history=history)
+        # -----------------------------------------------------------
+        # 11. 1차: RAG 기반 OpenAI 답변
+        # -----------------------------------------------------------
+        answer = (
+            await self.openai.answer_with_context(
+                query,
+                contexts,
+                history=history,
+            )
+        ).strip()
 
+        # -----------------------------------------------------------
+        # 12. RAG 자료는 검색됐지만 실제 질문의 답이 없었던 경우
+        # -----------------------------------------------------------
+        # clients.py에서 추가한 특별 신호를 여기서 잡습니다.
+        if answer == "__RAG_FALLBACK__":
+            fallback_answer = (
+                await self.openai.answer_without_context(
+                    query,
+                    history=history,
+                )
+            )
+
+            return RagSearchResponse(
+                query=query,
+                answer=fallback_answer,
+                hits=[],
+                grounded=False,
+            )
+
+        # -----------------------------------------------------------
+        # 13. RAG 자료로 정상적으로 답변한 경우
+        # -----------------------------------------------------------
         return RagSearchResponse(
             query=query,
             answer=answer,
             hits=hits,
+            grounded=True,
         )
 
 def _cosine(

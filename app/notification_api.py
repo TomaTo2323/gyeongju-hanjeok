@@ -7,8 +7,13 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from .auth_service import get_current_user
-from .db import NotificationRecord, UserPublicProfileRecord, UserRecord, get_db
+from app.auth_service import get_current_user
+from app.db import (
+    NotificationRecord,
+    UserPublicProfileRecord,
+    UserRecord,
+    get_db,
+)
 
 notification_router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -42,17 +47,24 @@ class UnreadCountResponse(BaseModel):
     unread_count: int
 
 
+def _user_id(user: UserRecord) -> str:
+    return user.user_id
+
+
 def _actor(db: Session, actor_user_id: str | None) -> NotificationActorResponse | None:
     if not actor_user_id:
         return None
+
     user = db.get(UserRecord, actor_user_id)
     if user is None:
         return None
-    profile = db.get(UserPublicProfileRecord, actor_user_id)
+
+    profile = db.get(UserPublicProfileRecord, user.user_id)
+
     return NotificationActorResponse(
         user_id=user.user_id,
         member_code=profile.member_code if profile is not None else None,
-        nickname=user.nickname,
+        nickname=user.nickname or "경주한적 사용자",
     )
 
 
@@ -79,7 +91,7 @@ def list_notifications(
     db: Session = Depends(get_db),
     current_user: UserRecord = Depends(get_current_user),
 ):
-    uid = current_user.user_id
+    uid = _user_id(current_user)
     stmt = select(NotificationRecord).where(NotificationRecord.user_id == uid)
     if unread_only:
         stmt = stmt.where(NotificationRecord.is_read.is_(False))
@@ -107,7 +119,7 @@ def unread_count(
     db: Session = Depends(get_db),
     current_user: UserRecord = Depends(get_current_user),
 ):
-    uid = current_user.user_id
+    uid = _user_id(current_user)
     count = int(
         db.scalar(
             select(func.count())
@@ -127,7 +139,7 @@ def mark_read(
     db: Session = Depends(get_db),
     current_user: UserRecord = Depends(get_current_user),
 ):
-    uid = current_user.user_id
+    uid = _user_id(current_user)
     row = db.get(NotificationRecord, notification_id)
     if row is None or row.user_id != uid:
         raise HTTPException(status_code=404, detail="알림을 찾을 수 없습니다.")
@@ -147,14 +159,17 @@ def mark_all_read(
     db: Session = Depends(get_db),
     current_user: UserRecord = Depends(get_current_user),
 ):
-    uid = current_user.user_id
+    uid = _user_id(current_user)
     db.execute(
         update(NotificationRecord)
         .where(
             NotificationRecord.user_id == uid,
             NotificationRecord.is_read.is_(False),
         )
-        .values(is_read=True, read_at=datetime.now(timezone.utc))
+        .values(
+            is_read=True,
+            read_at=datetime.now(timezone.utc),
+        )
     )
     db.commit()
     return UnreadCountResponse(unread_count=0)

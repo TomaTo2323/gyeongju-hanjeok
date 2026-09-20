@@ -51,16 +51,6 @@ class Place(BaseModel):
     is_free: bool | None = None
     parking: str | None = None
 
-    # 축제/공연/행사(contentTypeId=15) 메타데이터
-    # 날짜/시간이 실제 TourAPI 응답에 있을 때만 채우며 임의 시간을 만들지 않습니다.
-    event_start_date: str | None = None
-    event_end_date: str | None = None
-    event_start_time: str | None = None
-    event_end_time: str | None = None
-    event_place: str | None = None
-    event_time_type: str | None = None  # fixed | flexible | unknown
-    source: str | None = None
-
     # 각 상세정보의 실제 출처
     overview_source: str | None = None
     fee_source: str | None = None
@@ -143,17 +133,21 @@ class Course(BaseModel):
 
 
 class RecommendRequest(BaseModel):
-    # User GPS is intentionally not accepted by the backend.
-    # Recommendation services use a fixed Gyeongju service anchor.
+    # 코스 만들기에서 사용자가 선택한 실제 출발 좌표입니다.
+    # 값이 오지 않는 구버전 요청만 경주 기본 좌표로 fallback 합니다.
+    # 이 좌표는 경주 관광지 후보를 제한하는 용도가 아니라
+    # 첫 방문지/방문 순서/첫 이동거리·시간 계산의 기준점으로 사용합니다.
+    latitude: float = Field(
+        default=GYEONGJU_CENTER_LATITUDE,
+        ge=-90,
+        le=90,
+    )
+    longitude: float = Field(
+        default=GYEONGJU_CENTER_LONGITUDE,
+        ge=-180,
+        le=180,
+    )
     start_time: datetime | None = None
-
-    @property
-    def latitude(self) -> float:
-        return GYEONGJU_CENTER_LATITUDE
-
-    @property
-    def longitude(self) -> float:
-        return GYEONGJU_CENTER_LONGITUDE
     available_minutes: int = Field(default=240, ge=60, le=1440)
     transport: TransportMode = TransportMode.walking
     radius_km: float = Field(default=8, gt=0, le=30)

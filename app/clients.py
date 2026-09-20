@@ -484,93 +484,6 @@ class TourApiClient(BaseClient):
         return [p for p in places if p is not None]
 
 
-    async def search_festivals(
-        self,
-        travel_date: date,
-        limit: int = 30,
-    ) -> list[Place]:
-        """경주시에서 travel_date에 실제 진행 중인 축제/공연/행사를 조회합니다.
-
-        사용자 위치는 사용하지 않습니다. 경주시 공개 지역코드와 여행 날짜만
-        TourAPI ``searchFestival2``에 전달합니다. API 버전에 따라 지역코드
-        방식이 달라질 수 있어 기존 areaCode/sigunguCode 결과가 비면
-        법정동 코드(경주시 47/130) 방식으로 한 번 더 조회합니다.
-        """
-        ymd = travel_date.strftime("%Y%m%d")
-
-        # searchFestival2의 eventStartDate는 "그 날짜 이후 시작하는 행사"를
-        # 찾는 기준이므로 여행 날짜만 넣으면 이미 시작해서 진행 중인 장기
-        # 행사가 누락될 수 있습니다.
-        #
-        # 따라서 여행일 기준 최대 366일 전부터 여행일까지 넓게 조회한 뒤,
-        # 아래의 start <= travel_date <= end 검증으로 실제 여행일에 진행 중인
-        # 행사만 남깁니다. 사용자 GPS는 이 요청에 전혀 사용하지 않습니다.
-        query_start_date = travel_date - timedelta(days=366)
-        query_start_ymd = query_start_date.strftime("%Y%m%d")
-
-        common = self._auth_params() | {
-            "eventStartDate": query_start_ymd,
-            "eventEndDate": ymd,
-            "arrange": "C",
-            # 넓은 조회 구간에서 진행 중 행사를 놓치지 않도록 한 페이지 최대치를
-            # 요청하고, 실제 반환 개수는 아래에서 limit으로 다시 제한합니다.
-            "numOfRows": 100,
-            "pageNo": 1,
-        }
-
-        async def one(params: dict[str, Any]) -> list[dict[str, Any]]:
-            payload = await self._get(
-                "tour_api",
-                f"{self.settings.tour_api_base_url}/searchFestival2",
-                params=params,
-            )
-            return _items(payload)
-
-        legacy_items = await one(
-            common
-            | {
-                "areaCode": self.settings.tour_area_code,
-                "sigunguCode": self.settings.tour_sigungu_code,
-            }
-        )
-
-        ldong_items: list[dict[str, Any]] = []
-        if not legacy_items:
-            ldong_items = await one(
-                common
-                | {
-                    "lDongRegnCd": "47",
-                    "lDongSignguCd": "130",
-                }
-            )
-
-        places: list[Place] = []
-        seen: set[str] = set()
-
-        for item in [*legacy_items, *ldong_items]:
-            place = self._place_from_summary(item)
-            if place is None or place.place_id in seen:
-                continue
-
-            start_text = (place.event_start_date or "").replace("-", "")
-            end_text = (place.event_end_date or "").replace("-", "")
-
-            # API가 범위를 넓게 반환하는 경우에도 해당 날짜에 실제 진행 중인
-            # 행사만 남깁니다. 날짜가 비어 있으면 임의로 추정하지 않습니다.
-            if start_text and ymd < start_text:
-                continue
-            if end_text and ymd > end_text:
-                continue
-
-            seen.add(place.place_id)
-            places.append(place)
-
-            if len(places) >= limit:
-                break
-
-        return places
-
-
     async def keyword_search_global(
         self,
         keyword: str,
@@ -1003,33 +916,14 @@ class TourApiClient(BaseClient):
                     )
                     or resolved_place.homepage
                     or place.homepage,
+                "operating_hours":
+                    operating_hours,
                 "rest_date":
                     rest_date,
                 "fee_text":
                     fee_text,
                 "parking":
                     parking,
-                "event_start_date": (
-                    place.event_start_date
-                    or str((place.raw or {}).get("eventstartdate") or "").strip()
-                    or None
-                ),
-                "event_end_date": (
-                    place.event_end_date
-                    or str((place.raw or {}).get("eventenddate") or "").strip()
-                    or None
-                ),
-                "event_place": (
-                    _clean_html(intro.get("eventplace"))
-                    or place.event_place
-                ),
-                # playtime은 실제 응답 원문만 보존합니다. 시간대 해석은
-                # 추천 서비스에서 수행하며, 정보가 없으면 임의 시간을 만들지 않습니다.
-                "operating_hours": (
-                    _clean_html(intro.get("playtime"))
-                    or operating_hours
-                ),
-                "source": place.source or "KTO_TOUR_API",
                 "raw": {
                     "summary":
                         resolved_place.raw
@@ -1177,10 +1071,6 @@ class TourApiClient(BaseClient):
             image_url=item.get("firstimage") or None,
             thumbnail_url=item.get("firstimage2") or None,
             tel=item.get("tel") or None,
-            event_start_date=(str(item.get("eventstartdate") or "").strip() or None),
-            event_end_date=(str(item.get("eventenddate") or "").strip() or None),
-            event_place=(str(item.get("eventplace") or "").strip() or None),
-            source=("KTO_TOUR_API" if content_type == "15" else None),
             raw=item,
         )
 
@@ -3115,8 +3005,16 @@ class OpenAIClient(BaseClient):
     @property
     def headers(self) -> dict[str, str]:
         if not self.settings.openai_api_key:
-            raise IntegrationError("openai", "OPENAI_API_KEY가 설정되지 않았습니다.", status_code=503)
-        return {"Authorization": f"Bearer {self.settings.openai_api_key}", "Content-Type": "application/json"}
+            raise IntegrationError(
+                "openai",
+                "OPENAI_API_KEY가 설정되지 않았습니다.",
+                status_code=503,
+            )
+
+        return {
+            "Authorization": f"Bearer {self.settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
 
     async def parse_route_request(
         self,
@@ -3155,10 +3053,18 @@ class OpenAIClient(BaseClient):
                         ],
                     },
                 },
-                "include_food": {"type": "boolean"},
-                "include_cafe": {"type": "boolean"},
-                "free_only": {"type": "boolean"},
-                "short_walk": {"type": "boolean"},
+                "include_food": {
+                    "type": "boolean",
+                },
+                "include_cafe": {
+                    "type": "boolean",
+                },
+                "free_only": {
+                    "type": "boolean",
+                },
+                "short_walk": {
+                    "type": "boolean",
+                },
             },
             "required": [
                 "required_places",
@@ -3180,9 +3086,11 @@ class OpenAIClient(BaseClient):
                     "content": (
                         "경주 여행 코스 요청을 구조화하세요. "
                         "사용자가 직접 말한 장소명만 required_places 또는 "
-                        "excluded_places에 넣으세요. 장소명을 추측하거나 새로 "
-                        "만들지 마세요. '첨성대 가고 싶어'는 required_places에 "
-                        "'첨성대'를 넣습니다. 음식점/맛집 요청은 include_food, "
+                        "excluded_places에 넣으세요. "
+                        "장소명을 추측하거나 새로 만들지 마세요. "
+                        "'첨성대 가고 싶어'는 required_places에 "
+                        "'첨성대'를 넣습니다. "
+                        "음식점/맛집 요청은 include_food, "
                         "카페 요청은 include_cafe에 반영하세요."
                     ),
                 },
@@ -3214,73 +3122,59 @@ class OpenAIClient(BaseClient):
 
         return json.loads(text)
 
-
-    async def parse_course_command(self, command: str, place_names: list[str]) -> dict[str, Any]:
+    async def parse_course_command(
+        self,
+        command: str,
+        place_names: list[str],
+    ) -> dict[str, Any]:
         schema = {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["remove", "add", "replace", "reorder", "set_condition", "keep"]},
-                "target": {"type": ["string", "null"]},
-                "replacement": {"type": ["string", "null"]},
-                "position": {"type": ["integer", "null"]},
-                "conditions": {"type": "array", "items": {"type": "string"}},
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "remove",
+                        "add",
+                        "replace",
+                        "reorder",
+                        "set_condition",
+                        "keep",
+                    ],
+                },
+                "target": {
+                    "type": [
+                        "string",
+                        "null",
+                    ],
+                },
+                "replacement": {
+                    "type": [
+                        "string",
+                        "null",
+                    ],
+                },
+                "position": {
+                    "type": [
+                        "integer",
+                        "null",
+                    ],
+                },
+                "conditions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                    },
+                },
             },
-            "required": ["action", "target", "replacement", "position", "conditions"],
+            "required": [
+                "action",
+                "target",
+                "replacement",
+                "position",
+                "conditions",
+            ],
             "additionalProperties": False,
         }
-        body = {
-            "model": self.settings.openai_model,
-            "input": [
-                {"role": "system", "content": "한국어 관광 코스 수정 명령을 구조화하세요. 장소명은 가능한 한 제공 목록과 정확히 맞추세요."},
-                {"role": "user", "content": f"현재 장소: {place_names}\n명령: {command}"},
-            ],
-            "text": {"format": {"type": "json_schema", "name": "course_command", "strict": True, "schema": schema}},
-        }
-        payload = await self._post("openai", f"{self.settings.openai_base_url}/responses", json_body=body, headers=self.headers)
-        text = _extract_openai_text(payload)
-        return json.loads(text)
-
-
-    async def answer_with_context(
-        self,
-        query: str,
-        contexts: list[dict[str, Any]],
-        history: list[ChatTurn] | None = None,
-    ) -> str:
-        def _line(label: str, value: Any) -> str:
-            return f"{label}: {value}" if value else ""
-
-        # 번호([1])가 아니라 자료 제목으로 인용하게 한다. RagService가 LLM에 보여주는
-        # 자료 목록과 화면에 표시하는 "참고한 자료" 칩 목록의 개수/순서가 다를 수 있어서,
-        # 번호로 인용하면 화면의 몇 번째 칩과 실제로 안 맞을 수 있기 때문이다.
-        blocks = []
-        for c in contexts:
-            fields = "\n".join(
-                filter(
-                    None,
-                    [
-                        _line("주소", c.get("address")),
-                        _line("운영시간", c.get("operating_hours")),
-                        _line("휴무일", c.get("rest_date")),
-                        _line("요금", c.get("fee_text")),
-                        _line("주차", c.get("parking")),
-                        _line("유모차", c.get("stroller_info")),
-                        _line("반려동물 동반", c.get("pet_info")),
-                        _line("카드결제", c.get("credit_card_info")),
-                        _line("홈페이지", c.get("homepage")),
-                    ],
-                )
-            )
-            blocks.append(
-                f"[{c.get('title')}] | {c.get('category')}\n"
-                f"{c.get('overview') or ''}\n{fields}"
-            )
-        context_text = "\n\n".join(blocks)
-
-        # 직전 대화(최근 몇 턴)를 그대로 이전 메시지로 끼워 넣는다. 이렇게 하면 "거기 주차는
-        # 되나요?" 같은 후속 질문에서 "거기"가 뭘 가리키는지 모델이 대화 흐름으로 이해할 수 있다.
-        # 근거 자료는 매번 새로 검색한 것만 신뢰하도록, 참고 자료는 항상 마지막 user 메시지에만 붙인다.
-        history_messages = [{"role": turn.role, "content": turn.content} for turn in (history or [])]
 
         body = {
             "model": self.settings.openai_model,
@@ -3288,42 +3182,364 @@ class OpenAIClient(BaseClient):
                 {
                     "role": "system",
                     "content": (
-                        "당신은 경주 관광 안내 챗봇입니다. 아래 [제목]이 붙은 자료만 근거로 한국어로 답하세요.\n"
-                        "- 자료에 없는 사실은 절대로 지어내지 말고, 그 부분은 확인할 수 없다고 명시하세요.\n"
-                        "- 질문에 답할 만한 자료가 부족하면 억지로 답하지 말고 "
-                        "\"확인할 수 있는 자료가 부족합니다\"라고 답하세요. "
-                        "이때 자료에 홈페이지 주소가 있으면 거기서 확인해보라고 안내하세요.\n"
-                        "- 답변 근거로 사용한 자료는 대괄호 안 제목 그대로 표시하세요 (예: [경주 동궁과 월지]).\n"
-                        "- 특정 국가·인종·종교 집단 전체를 일반화하는 발언은 하지 마세요. 역사적 국제교류는 "
-                        "구체적인 유물·유적 사실로만 설명하고, 학계에서 이견이 있는 내용은 정설처럼 "
-                        "단정하지 말고 자료에 적힌 대로 이견이 있다는 점을 함께 전하세요.\n"
-                        "- 이전 대화가 있다면 '그거', '거기', '거긴' 같은 지시어가 이전 대화의 어떤 "
-                        "관광지·주제를 가리키는지 참고해서 답하세요."
+                        "한국어 관광 코스 수정 명령을 구조화하세요. "
+                        "장소명은 가능한 한 제공 목록과 정확히 맞추세요."
                     ),
                 },
-                *history_messages,
-                {"role": "user", "content": f"질문: {query}\n\n참고 자료:\n{context_text}"},
+                {
+                    "role": "user",
+                    "content": (
+                        f"현재 장소: {place_names}\n"
+                        f"명령: {command}"
+                    ),
+                },
             ],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "course_command",
+                    "strict": True,
+                    "schema": schema,
+                }
+            },
         }
-        # RAG 컨텍스트(관광지+지식 문서)가 늘어날수록 모델이 답을 만드는 데 걸리는 시간도
-        # 길어져서, 다른 API 호출에 쓰는 기본 20초 타임아웃으로는 가끔 502가 났다.
-        # 이 호출만 넉넉하게 60초로 늘린다.
+
         payload = await self._post(
             "openai",
             f"{self.settings.openai_base_url}/responses",
             json_body=body,
             headers=self.headers,
-            timeout_seconds=60.0,
-)
-        return _extract_openai_text(payload)
+        )
 
-    async def embeddings(self, texts: list[str]) -> list[list[float]]:
+        text = _extract_openai_text(
+            payload
+        )
+
+        return json.loads(text)
+
+    async def answer_with_context(
+        self,
+        query: str,
+        contexts: list[dict[str, Any]],
+        history: list[ChatTurn] | None = None,
+    ) -> str:
+        """
+        1차 답변 단계.
+
+        검색된 RAG 자료 안에서 질문에 답할 수 있으면
+        반드시 RAG 자료를 우선하여 답변합니다.
+
+        RAG 자료만으로 질문에 충분히 답할 수 없다면
+        __RAG_FALLBACK__ 을 반환하여 RagService가
+        일반 OpenAI 지식 답변으로 전환할 수 있게 합니다.
+        """
+
+        def _line(
+            label: str,
+            value: Any,
+        ) -> str:
+            return (
+                f"{label}: {value}"
+                if value
+                else ""
+            )
+
+        blocks: list[str] = []
+
+        for context in contexts:
+            fields = "\n".join(
+                filter(
+                    None,
+                    [
+                        _line(
+                            "주소",
+                            context.get(
+                                "address"
+                            ),
+                        ),
+                        _line(
+                            "운영시간",
+                            context.get(
+                                "operating_hours"
+                            ),
+                        ),
+                        _line(
+                            "휴무일",
+                            context.get(
+                                "rest_date"
+                            ),
+                        ),
+                        _line(
+                            "요금",
+                            context.get(
+                                "fee_text"
+                            ),
+                        ),
+                        _line(
+                            "주차",
+                            context.get(
+                                "parking"
+                            ),
+                        ),
+                        _line(
+                            "유모차",
+                            context.get(
+                                "stroller_info"
+                            ),
+                        ),
+                        _line(
+                            "반려동물 동반",
+                            context.get(
+                                "pet_info"
+                            ),
+                        ),
+                        _line(
+                            "카드결제",
+                            context.get(
+                                "credit_card_info"
+                            ),
+                        ),
+                        _line(
+                            "홈페이지",
+                            context.get(
+                                "homepage"
+                            ),
+                        ),
+                    ],
+                )
+            )
+
+            blocks.append(
+                f"[{context.get('title')}] | "
+                f"{context.get('category')}\n"
+                f"{context.get('overview') or ''}\n"
+                f"{fields}"
+            )
+
+        context_text = "\n\n".join(
+            blocks
+        )
+
+        history_messages = [
+            {
+                "role": turn.role,
+                "content": turn.content,
+            }
+            for turn in (
+                history or []
+            )
+        ]
+
+        body = {
+            "model": self.settings.openai_model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": (
+                        "당신은 경주 관광 안내 챗봇입니다.\n"
+                        "이번 단계에서는 아래 [제목]이 붙은 "
+                        "RAG 자료를 최우선 근거로 사용해 "
+                        "한국어로 답하세요.\n\n"
+
+                        "- RAG 자료 안에 사용자의 질문에 "
+                        "직접 답할 수 있는 충분한 근거가 있다면 "
+                        "그 자료를 바탕으로 정확하게 답하세요.\n"
+
+                        "- 답변 근거로 사용한 자료는 "
+                        "대괄호 안 제목 그대로 표시하세요. "
+                        "예: [경주 동궁과 월지]\n"
+
+                        "- 관련 관광지 자료가 검색되었다는 이유만으로 "
+                        "자료에 없는 내용을 추측해서 채우지 마세요.\n"
+
+                        "- 질문의 핵심 답이 RAG 자료 안에 없거나, "
+                        "현재 자료만으로 정확하게 답하기 어렵다면 "
+                        "사용자에게 '자료가 부족합니다'라고 "
+                        "답하지 마세요.\n"
+
+                        "- 위 경우에는 설명, 사과, 추가 안내를 "
+                        "붙이지 말고 정확히 다음 문자열 하나만 "
+                        "출력하세요:\n"
+                        "__RAG_FALLBACK__\n"
+
+                        "- 역사적 사실에 여러 학설이나 견해가 있으면 "
+                        "하나를 확정된 사실처럼 단정하지 마세요.\n"
+
+                        "- 특정 국가·인종·종교 집단 전체를 "
+                        "일반화하지 마세요.\n"
+
+                        "- 이전 대화가 있다면 '그거', '거기', "
+                        "'거긴' 같은 지시어가 이전 대화의 "
+                        "어떤 관광지나 주제를 가리키는지 "
+                        "대화 흐름을 참고하세요."
+                    ),
+                },
+                *history_messages,
+                {
+                    "role": "user",
+                    "content": (
+                        f"질문: {query}\n\n"
+                        f"참고 자료:\n"
+                        f"{context_text}"
+                    ),
+                },
+            ],
+        }
+
+        payload = await self._post(
+            "openai",
+            (
+                f"{self.settings.openai_base_url}"
+                "/responses"
+            ),
+            json_body=body,
+            headers=self.headers,
+            timeout_seconds=60.0,
+        )
+
+        return _extract_openai_text(
+            payload
+        ).strip()
+
+    async def answer_without_context(
+        self,
+        query: str,
+        history: list[ChatTurn] | None = None,
+    ) -> str:
+        """
+        2차 답변 단계.
+
+        RAG 자료만으로 충분히 답할 수 없을 때
+        OpenAI의 일반 지식을 사용합니다.
+
+        단, 불확실한 역사 사실이나 최신 정보는
+        임의로 만들어내지 않습니다.
+        """
+
+        history_messages = [
+            {
+                "role": turn.role,
+                "content": turn.content,
+            }
+            for turn in (
+                history or []
+            )
+        ]
+
+        body = {
+            "model": self.settings.openai_model,
+            "input": [
+                {
+                    "role": "system",
+                    "content": (
+                        "당신은 경주 여행과 역사·문화 정보를 "
+                        "안내하는 한국어 관광 챗봇입니다.\n\n"
+
+                        "현재 질문은 검색된 RAG 자료만으로 "
+                        "충분히 답할 수 없어 OpenAI의 일반 지식을 "
+                        "이용해 답하는 단계입니다.\n\n"
+
+                        "- 널리 알려져 있고 신뢰할 수 있으며 "
+                        "당신이 높은 확신을 가진 사실은 "
+                        "적극적으로 답하세요.\n"
+
+                        "- RAG에 정보가 없었다는 이유만으로 "
+                        "'자료가 부족합니다'라고 회피하지 마세요.\n"
+
+                        "- 확신할 수 없는 인물명, 연도, 건립자, "
+                        "사건, 문화재의 세부 사실은 "
+                        "추측해서 만들지 마세요.\n"
+
+                        "- 여러 학설이나 견해가 존재하는 내용은 "
+                        "확정된 사실과 학설을 명확히 구분해서 "
+                        "설명하세요.\n"
+
+                        "- 일부 인터넷 자료에서 널리 반복되는 주장이라도 "
+                        "정설인지 확실하지 않다면 "
+                        "'이런 견해가 있다'고 구분해서 설명하세요.\n"
+
+                        "- 사용자의 질문이나 전제에 사실 오류가 "
+                        "있을 가능성이 있으면 그대로 맞장구치지 말고 "
+                        "알려진 사실과 견해를 구분해 설명하세요.\n"
+
+                        "- 운영시간, 휴무일, 입장료, 행사 일정, "
+                        "날씨, 현재 혼잡도처럼 수시로 바뀌는 정보는 "
+                        "모델의 일반 지식만으로 최신 정보처럼 "
+                        "단정하지 마세요.\n"
+
+                        "- 정확하게 알 수 없는 부분은 "
+                        "모른다고 말하세요. "
+                        "하지만 확실하게 답할 수 있는 내용까지 "
+                        "회피하지 마세요.\n"
+
+                        "- 질문에 대한 직접적인 답을 먼저 말하고 "
+                        "그 뒤에 필요한 설명을 덧붙이세요.\n"
+
+                        "- 경주 관광과 관련 없는 사실을 "
+                        "임의로 만들어내지 마세요."
+                    ),
+                },
+                *history_messages,
+                {
+                    "role": "user",
+                    "content": query,
+                },
+            ],
+        }
+
+        payload = await self._post(
+            "openai",
+            (
+                f"{self.settings.openai_base_url}"
+                "/responses"
+            ),
+            json_body=body,
+            headers=self.headers,
+            timeout_seconds=60.0,
+        )
+
+        return _extract_openai_text(
+            payload
+        ).strip()
+
+    async def embeddings(
+        self,
+        texts: list[str],
+    ) -> list[list[float]]:
         if not texts:
             return []
-        body = {"model": self.settings.openai_embedding_model, "input": texts}
-        payload = await self._post("openai", f"{self.settings.openai_base_url}/embeddings", json_body=body, headers=self.headers)
-        return [row["embedding"] for row in sorted(payload.get("data", []), key=lambda x: x.get("index", 0))]
 
+        body = {
+            "model":
+                self.settings.openai_embedding_model,
+            "input":
+                texts,
+        }
+
+        payload = await self._post(
+            "openai",
+            (
+                f"{self.settings.openai_base_url}"
+                "/embeddings"
+            ),
+            json_body=body,
+            headers=self.headers,
+        )
+
+        return [
+            row["embedding"]
+            for row in sorted(
+                payload.get(
+                    "data",
+                    [],
+                ),
+                key=lambda item:
+                    item.get(
+                        "index",
+                        0,
+                    ),
+            )
+        ]
 
 class PhotoClient(BaseClient):
     async def search(self, keyword: str, limit: int = 10) -> list[dict[str, Any]]:

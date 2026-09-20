@@ -176,56 +176,38 @@ def health(
     tags=["places"],
 )
 async def places(
-    query: str | None = Query(
-        None,
-        min_length=1,
-        max_length=100,
-    ),
     radius_km: float = Query(8, gt=0, le=20),
     limit: int = Query(30, ge=1, le=100),
     settings: Settings = Depends(get_settings),
 ):
     """
-    홈/지도용 관광지 목록 및 장소명 검색.
+    홈/지도용 관광지 목록.
 
-    위치정보 정책상 사용자의 현재 위치나 지도 중심 좌표를 입력받지 않습니다.
-    일반 목록은 서버에 정의된 경주 고정 중심 좌표를 사용하고,
-    query가 있으면 관광공사 경주 지역 키워드 검색만 수행합니다.
-
-    반환 장소에는 추천 코스와 동일한 방식으로
+    관광공사 장소 목록만 반환하지 않고 추천 코스와 동일한 방식으로
     공식 혼잡도 + NAVER 검색 트렌드 + 시간/요일 + 날씨를 결합해
-    congestion_score를 계산합니다.
+    congestion_score를 계산해서 반환합니다.
 
     congestion_score의 기준은 0~100입니다.
     0 = 매우 한산 / 100 = 매우 혼잡
     """
 
-    # 중요: 아래 좌표는 사용자 위치가 아니라 서버에 정의된 경주 고정 중심입니다.
-    # 이 엔드포인트에 latitude/longitude 요청 파라미터를 추가하지 않습니다.
     latitude = GYEONGJU_CENTER_LATITUDE
     longitude = GYEONGJU_CENTER_LONGITUDE
 
-    search_query = (query or "").strip()
+    cache_key = _places_cache_key(
+        latitude,
+        longitude,
+        radius_km,
+        limit,
+    )
 
-    # 일반 목록만 기존 캐시를 사용합니다.
-    # 검색어가 있는 요청은 query가 캐시 키에 포함되지 않으므로 캐시를 우회합니다.
-    cache_key: str | None = None
+    cached = _cache_get(
+        cache_key,
+        settings.cache_ttl_seconds,
+    )
 
-    if not search_query:
-        cache_key = _places_cache_key(
-            latitude,
-            longitude,
-            radius_km,
-            limit,
-        )
-
-        cached = _cache_get(
-            cache_key,
-            settings.cache_ttl_seconds,
-        )
-
-        if cached is not None:
-            return cached
+    if cached is not None:
+        return cached
 
     tour = TourApiClient(settings)
     congestion_client = CongestionClient(settings)
@@ -236,26 +218,17 @@ async def places(
     recommendation = RecommendationService(settings)
 
     try:
-        if search_query:
-            # 장소명만 관광공사 경주 지역 키워드 검색에 전달합니다.
-            # 사용자/지도 좌표는 외부 API 또는 이 백엔드로 전달되지 않습니다.
-            result = await tour.keyword_search(
-                search_query,
-                limit=limit,
-            )
-        else:
-            result = await tour.nearby_places(
-                latitude,
-                longitude,
-                int(radius_km * 1000),
-                limit,
-            )
+        result = await tour.nearby_places(
+            latitude,
+            longitude,
+            int(radius_km * 1000),
+            limit,
+        )
 
         if not result:
             return []
 
-        # 거리 계산은 사용자 위치가 아닌 경주 고정 중심 기준입니다.
-        # 실제 사용자와 장소 간 거리가 필요하면 프론트 단말에서만 계산합니다.
+        # 거리 계산
         for place in result:
             place.distance_km = round(
                 haversine_km(
@@ -279,7 +252,7 @@ async def places(
         try:
             congestion_map = await congestion_client.score_map()
         except IntegrationError:
-            # 공식 혼잡 API 장애가 홈/검색 전체를 막지는 않게 합니다.
+            # 공식 혼잡 API 장애가 홈 전체를 막지는 않게 합니다.
             congestion_map = {}
 
         for place in result:
@@ -308,8 +281,8 @@ async def places(
         # ---------------------------------------------------------------
         # 3. NAVER DataLab 검색 트렌드
         #
-        # 장소가 많으면 요청이 늘어나므로 최대 15곳을 DataLab으로 보강하고,
-        # 나머지는 공식+시간+날씨 신호로 계산합니다.
+        # 장소가 많으면 요청이 늘어나므로 홈에서는 우선 최대 15곳을
+        # DataLab으로 보강하고, 나머지는 공식+시간+날씨 신호로 계산합니다.
         # ---------------------------------------------------------------
 
         trend_scores: dict[str, float] = {}
@@ -341,8 +314,7 @@ async def places(
                 weather,
             )
 
-        # 기존 홈 목록과 동일하게 한산한 장소가 먼저 보이도록 정렬합니다.
-        # 프론트의 장소명 매칭은 반환 목록 전체를 대상으로 수행합니다.
+        # 한산한 장소가 먼저 보이도록 정렬
         result.sort(
             key=lambda place: (
                 place.congestion_score
@@ -351,11 +323,10 @@ async def places(
             )
         )
 
-        if cache_key is not None:
-            _cache_put(
-                cache_key,
-                result,
-            )
+        _cache_put(
+            cache_key,
+            result,
+        )
 
         return result
 
