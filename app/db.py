@@ -35,6 +35,36 @@ class KnowledgeDocument(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+
+
+# CHATBOT_CACHE_V2_START
+class ChatAnswerCacheRecord(Base):
+    """안정적인 지식형 챗봇 답변만 저장하는 소형 캐시 테이블입니다."""
+
+    __tablename__ = "chat_answer_cache"
+
+    cache_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    place_id: Mapped[str] = mapped_column(String(64), index=True)
+    place_name: Mapped[str] = mapped_column(String(255), index=True)
+    intent: Mapped[str] = mapped_column(String(64), index=True)
+    question_example: Mapped[str] = mapped_column(String(500))
+    answer: Mapped[str] = mapped_column(String)
+    sources_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+# CHATBOT_CACHE_V2_END
+
 class JourneyRecord(Base):
     __tablename__ = "journeys"
     journey_id: Mapped[str] = mapped_column(String(64), primary_key=True, default=lambda: str(uuid4()))

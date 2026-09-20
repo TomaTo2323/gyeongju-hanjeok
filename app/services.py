@@ -26,7 +26,19 @@ from .clients import (
     normalize_name,
 )
 from .config import Settings
+from .chatbot_knowledge import (
+    HeritageLookupClient,
+    cacheable_answer,
+    classify_stable_intent,
+    contexts_hash,
+    direct_answer_from_heritage,
+    is_dynamic_query,
+    local_place_context,
+    make_cache_key,
+    resolved_generation_query,
+)
 from .db import (
+    ChatAnswerCacheRecord,
     CommunityPostRecord,
     JourneyRecord,
     KnowledgeDocument,
@@ -7197,6 +7209,7 @@ class RagService:
         self.openai = OpenAIClient(settings)
         self.tour = TourApiClient(settings)
         self.official_tour = GyeongjuOfficialTourClient(settings)
+        self.heritage = HeritageLookupClient(settings)
 
     @classmethod
     def _place_aliases(cls, title: str) -> list[str]:
@@ -7447,6 +7460,220 @@ class RagService:
             bool(values),
         )
 
+
+    # CHATBOT_CACHE_V2_START
+    @staticmethod
+    def _cache_expired(value: datetime | None) -> bool:
+        if value is None:
+            return False
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value <= datetime.now(timezone.utc)
+
+    def _cached_answer(self, cache_key: str) -> ChatAnswerCacheRecord | None:
+        row = self.db.get(ChatAnswerCacheRecord, cache_key)
+        if row is None:
+            return None
+        if self._cache_expired(row.expires_at):
+            try:
+                self.db.delete(row)
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+            return None
+        row.hit_count = int(row.hit_count or 0) + 1
+        row.updated_at = datetime.now(timezone.utc)
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+        return row
+
+    @staticmethod
+    def _cache_hits(row: ChatAnswerCacheRecord) -> list[RagHit]:
+        raw_hits = (row.sources_json or {}).get("hits") or []
+        hits: list[RagHit] = []
+        for item in raw_hits:
+            try:
+                hits.append(RagHit.model_validate(item))
+            except Exception:
+                continue
+        return hits
+
+    def _store_answer_cache(
+        self,
+        *,
+        cache_key: str,
+        exact_place: PlaceRecord,
+        intent: str,
+        question: str,
+        answer: str,
+        hits: list[RagHit],
+        contexts: list[dict],
+    ) -> None:
+        if not cacheable_answer(answer):
+            return
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(days=180)
+        payload = {
+            "hits": [hit.model_dump(mode="json") for hit in hits],
+            "official_only": True,
+        }
+        row = self.db.get(ChatAnswerCacheRecord, cache_key)
+        if row is None:
+            row = ChatAnswerCacheRecord(
+                cache_key=cache_key,
+                place_id=exact_place.place_id,
+                place_name=exact_place.title,
+                intent=intent,
+                question_example=question,
+                answer=answer.strip(),
+                sources_json=payload,
+                source_hash=contexts_hash(contexts),
+                hit_count=0,
+                created_at=now,
+                updated_at=now,
+                expires_at=expires_at,
+            )
+            self.db.add(row)
+        else:
+            row.place_name = exact_place.title
+            row.intent = intent
+            row.question_example = question
+            row.answer = answer.strip()
+            row.sources_json = payload
+            row.source_hash = contexts_hash(contexts)
+            row.updated_at = now
+            row.expires_at = expires_at
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+
+    def _exact_knowledge_contexts(
+        self,
+        exact_place: PlaceRecord,
+        limit: int = 6,
+    ) -> tuple[list[dict], list[RagHit]]:
+        aliases = self._place_aliases(exact_place.title)
+        if not aliases:
+            return [], []
+        rows = list(self.db.scalars(select(KnowledgeDocument)).all())
+        contexts: list[dict] = []
+        hits: list[RagHit] = []
+        for row in rows:
+            searchable = normalize_name(f"{row.title} {row.text[:1600]}")
+            if not any(alias in searchable for alias in aliases):
+                continue
+            contexts.append({
+                "source": "경주한적 DB",
+                "title": row.title,
+                "category": row.category,
+                "overview": row.text,
+            })
+            hits.append(RagHit(
+                source_type="etiquette",
+                place_id=row.doc_id,
+                title=row.title,
+                category=row.category,
+                similarity=0.98,
+                overview=row.text,
+            ))
+            if len(contexts) >= limit:
+                break
+        return contexts, hits
+
+    async def _stable_exact_answer(
+        self,
+        *,
+        query: str,
+        history: list[ChatTurn],
+        exact_place: PlaceRecord,
+        intent: str,
+    ) -> RagSearchResponse | None:
+        if is_dynamic_query(query):
+            return None
+
+        cache_key = make_cache_key(exact_place.place_id, intent)
+        cached = self._cached_answer(cache_key)
+        if cached is not None:
+            return RagSearchResponse(
+                query=query,
+                answer=cached.answer,
+                hits=self._cache_hits(cached),
+                grounded=True,
+            )
+
+        heritage = None
+        try:
+            heritage = await asyncio.wait_for(
+                self.heritage.lookup(exact_place.title), timeout=7.0
+            )
+        except asyncio.TimeoutError:
+            heritage = None
+
+        contexts: list[dict] = [
+            local_place_context(exact_place.data or {}, title=exact_place.title)
+        ]
+        hits: list[RagHit] = [self._place_hit(exact_place, 1.0)]
+
+        local_contexts, local_hits = self._exact_knowledge_contexts(exact_place)
+        contexts.extend(local_contexts)
+        hits.extend(local_hits)
+
+        if heritage is not None:
+            contexts.insert(0, heritage.to_context())
+            hits.insert(0, RagHit.model_validate(heritage.to_hit_dict()))
+            direct = direct_answer_from_heritage(exact_place.title, intent, heritage)
+            if direct:
+                self._store_answer_cache(
+                    cache_key=cache_key,
+                    exact_place=exact_place,
+                    intent=intent,
+                    question=query,
+                    answer=direct,
+                    hits=hits[:5],
+                    contexts=contexts,
+                )
+                return RagSearchResponse(
+                    query=query, answer=direct, hits=hits[:5], grounded=True
+                )
+
+        meaningful = any(
+            ctx.get("overview")
+            or ctx.get("heritage_era")
+            or ctx.get("heritage_designation")
+            for ctx in contexts
+        )
+        if not meaningful:
+            return None
+
+        generation_query = resolved_generation_query(exact_place.title, query)
+        answer = (
+            await self.openai.answer_with_context(
+                generation_query, contexts, history=history
+            )
+        ).strip()
+
+        if answer == "__RAG_FALLBACK__":
+            return None
+
+        if cacheable_answer(answer):
+            self._store_answer_cache(
+                cache_key=cache_key,
+                exact_place=exact_place,
+                intent=intent,
+                question=query,
+                answer=answer,
+                hits=hits[:5],
+                contexts=contexts,
+            )
+
+        return RagSearchResponse(
+            query=query, answer=answer, hits=hits[:5], grounded=True
+        )
+    # CHATBOT_CACHE_V2_END
+
     async def search(
         self,
         query: str,
@@ -7525,6 +7752,17 @@ class RagService:
                 ],
                 grounded=grounded,
             )
+
+        stable_intent = classify_stable_intent(query)
+        if exact_place is not None and stable_intent is not None:
+            stable_response = await self._stable_exact_answer(
+                query=query,
+                history=history,
+                exact_place=exact_place,
+                intent=stable_intent,
+            )
+            if stable_response is not None:
+                return stable_response
 
         # -----------------------------------------------------------
         # 3. 현재 사용 가능한 RAG 인덱스 확인
