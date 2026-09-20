@@ -60,6 +60,7 @@ class UserRecord(Base):
     password_hash: Mapped[str] = mapped_column(String(512))
     nickname: Mapped[str] = mapped_column(String(40))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    role: Mapped[str] = mapped_column(String(20), default="user", index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
