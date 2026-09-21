@@ -2198,6 +2198,7 @@ def _pick_photo_gallery_rows(
 
 
 
+
 def _apply_photo_gallery_rows(
     place: Place,
     rows: list[dict[str, Any]],
@@ -2207,16 +2208,29 @@ def _apply_photo_gallery_rows(
         for row in rows
         if _photo_gallery_row_image_url(row)
     ]
-    gallery_urls = list(dict.fromkeys(gallery_urls))[:5]
-
-    if not gallery_urls:
-        return
+    gallery_urls = list(dict.fromkeys(gallery_urls))
 
     raw = dict(place.raw or {})
 
-    # 첫 장은 한국관광공사 국문 관광정보(KorService) 대표사진을 유지합니다.
+    common = (
+        raw.get("common")
+        if isinstance(raw.get("common"), dict)
+        else {}
+    )
+
+    summary = (
+        raw.get("summary")
+        if isinstance(raw.get("summary"), dict)
+        else {}
+    )
+
+    # 1번 사진은 반드시 한국관광공사 국문 관광정보 firstimage
     official_primary = str(
         raw.get("tour_api_primary_image")
+        or common.get("firstimage")
+        or common.get("firstImage")
+        or summary.get("firstimage")
+        or summary.get("firstImage")
         or raw.get("firstimage")
         or raw.get("firstImage")
         or place.image_url
@@ -2225,31 +2239,37 @@ def _apply_photo_gallery_rows(
 
     combined_urls: list[str] = []
 
-    def add_url(value: str) -> None:
+    def add_url(value: Any) -> None:
         url = str(value or "").strip()
+
         if not url.startswith(("http://", "https://")):
             return
+
         if url in combined_urls:
             return
+
         if len(combined_urls) >= 5:
             return
+
         combined_urls.append(url)
 
+    # 첫 번째는 국문 관광정보 대표사진
     add_url(official_primary)
 
-    # 관광사진 API는 대표사진 다음부터 보조사진으로 붙입니다.
+    # 이후는 관광사진 API
     for url in gallery_urls:
         add_url(url)
 
     if not combined_urls:
         return
 
-    # 국문 관광정보 대표사진이 없는 장소만 관광사진 첫 장을 대표로 사용합니다.
-    if not official_primary:
-        place.image_url = combined_urls[0]
-    else:
+    # 관광사진 API 사진이 기존 대표사진을 덮어쓰지 못하게 함
+    if official_primary:
         place.image_url = official_primary
         raw["tour_api_primary_image"] = official_primary
+    else:
+        # 국문 관광정보 대표사진이 정말 없을 때만 fallback
+        place.image_url = combined_urls[0]
 
     raw["photo_gallery"] = rows[0] if rows else {}
     raw["photo_gallery_rows"] = [dict(row) for row in rows]
@@ -2260,6 +2280,7 @@ def _apply_photo_gallery_rows(
         if official_primary
         else "kto_photo_gallery"
     )
+
     place.raw = raw
 
 async def _fill_place_images_from_photo_gallery(
@@ -2414,41 +2435,67 @@ async def _fill_place_images_from_photo_gallery(
 
 
 
-def _front_image_urls(place: Place) -> list[str]:
-    # 프론트 상세 갤러리용 이미지 목록.
-    # 국문 관광정보 대표사진이 항상 첫 번째이고 전체 최대 5장입니다.
-    raw = place.raw if isinstance(place.raw, dict) else {}
+
+def _front_image_urls(
+    place: Place,
+) -> list[str]:
+    raw = (
+        place.raw
+        if isinstance(place.raw, dict)
+        else {}
+    )
+
+    common = (
+        raw.get("common")
+        if isinstance(raw.get("common"), dict)
+        else {}
+    )
+
+    summary = (
+        raw.get("summary")
+        if isinstance(raw.get("summary"), dict)
+        else {}
+    )
+
     gallery = raw.get("photo_gallery_images")
 
-    candidates: list[str] = []
+    image_urls: list[str] = []
 
-    def add(value: Any) -> None:
+    def add_url(value: Any) -> None:
         url = str(value or "").strip()
+
         if not url.startswith(("http://", "https://")):
             return
-        if url in candidates:
-            return
-        if len(candidates) >= 5:
-            return
-        candidates.append(url)
 
-    # 1번 사진: 한국관광공사 국문 관광정보 대표사진
-    add(
+        if url in image_urls:
+            return
+
+        if len(image_urls) >= 5:
+            return
+
+        image_urls.append(url)
+
+    # 1번은 한국관광공사 국문 관광정보 firstimage
+    add_url(
         raw.get("tour_api_primary_image")
+        or common.get("firstimage")
+        or common.get("firstImage")
+        or summary.get("firstimage")
+        or summary.get("firstImage")
         or raw.get("firstimage")
         or raw.get("firstImage")
         or place.image_url
     )
 
-    # 2번 이후: 한국관광공사 관광사진 API 사진
+    # 2번 이후는 관광사진 API
     if isinstance(gallery, list):
         for value in gallery:
-            add(value)
+            add_url(value)
 
-    # 대표사진이 없는 장소의 fallback
-    add(place.image_url)
+    # 대표사진이 없는 특수한 경우의 fallback
+    add_url(place.image_url)
 
-    return candidates[:5]
+    return image_urls[:5]
 
 def _operating_hours_card_label(value: str | None) -> str:
     """카드용 짧은 운영시간 라벨. 추천시간과 혼동되지 않게 운영정보만 사용."""
