@@ -1,9 +1,51 @@
 from __future__ import annotations
 
-import smtplib
+import base64
 from email.message import EmailMessage
 
+import httpx
+
 from .config import Settings
+
+
+def _get_gmail_access_token(settings: Settings) -> str:
+    client_id = settings.gmail_client_id.strip()
+    client_secret = settings.gmail_client_secret.strip()
+    refresh_token = settings.gmail_refresh_token.strip()
+
+    if not client_id:
+        raise RuntimeError("GMAIL_CLIENT_ID가 설정되지 않았습니다.")
+    if not client_secret:
+        raise RuntimeError("GMAIL_CLIENT_SECRET이 설정되지 않았습니다.")
+    if not refresh_token:
+        raise RuntimeError("GMAIL_REFRESH_TOKEN이 설정되지 않았습니다.")
+
+    with httpx.Client(timeout=15.0) as client:
+        response = client.post(
+            settings.google_oauth_token_url,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+
+    if response.status_code != 200:
+        detail = response.text.strip()
+        if len(detail) > 1000:
+            detail = detail[:1000] + "..."
+        raise RuntimeError(
+            "Google OAuth access token 발급 실패 "
+            f"(status={response.status_code}, body={detail})"
+        )
+
+    data = response.json()
+    access_token = str(data.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("Google OAuth 응답에 access_token이 없습니다.")
+
+    return access_token
 
 
 def send_password_reset_code(
@@ -12,28 +54,17 @@ def send_password_reset_code(
     recipient_email: str,
     code: str,
 ) -> None:
-    username = settings.smtp_username.strip()
-    password = settings.smtp_password.strip()
-    from_email = (
-        settings.smtp_from_email.strip()
-        or username
-    )
+    from_email = settings.email_from_email.strip()
+    from_name = settings.email_from_name.strip() or "경주한적"
 
-    if (
-        not settings.smtp_host.strip()
-        or not username
-        or not password
-        or not from_email
-    ):
-        raise RuntimeError(
-            "SMTP 환경변수가 설정되지 않았습니다."
-        )
+    if not from_email:
+        raise RuntimeError("EMAIL_FROM_EMAIL이 설정되지 않았습니다.")
+
+    access_token = _get_gmail_access_token(settings)
 
     message = EmailMessage()
     message["Subject"] = "[경주한적] 비밀번호 변경 인증번호"
-    message["From"] = (
-        f"{settings.smtp_from_name} <{from_email}>"
-    )
+    message["From"] = f"{from_name} <{from_email}>"
     message["To"] = recipient_email
     message.set_content(
         "경주한적 비밀번호 변경 인증번호입니다.\n\n"
@@ -43,13 +74,31 @@ def send_password_reset_code(
         "본인이 요청하지 않았다면 이 이메일을 무시해 주세요."
     )
 
-    with smtplib.SMTP(
-        settings.smtp_host,
-        settings.smtp_port,
-        timeout=15,
-    ) as smtp:
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.ehlo()
-        smtp.login(username, password)
-        smtp.send_message(message)
+    raw = base64.urlsafe_b64encode(
+        message.as_bytes()
+    ).decode("ascii")
+
+    url = (
+        settings.gmail_api_base_url.strip().rstrip("/")
+        + "/users/me/messages/send"
+    )
+
+    with httpx.Client(timeout=15.0) as client:
+        response = client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json={"raw": raw},
+        )
+
+    if response.status_code not in {200, 201}:
+        detail = response.text.strip()
+        if len(detail) > 1000:
+            detail = detail[:1000] + "..."
+        raise RuntimeError(
+            "Gmail API 메일 전송 실패 "
+            f"(status={response.status_code}, body={detail})"
+        )
