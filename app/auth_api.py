@@ -32,6 +32,7 @@ class SignupRequest(BaseModel):
     terms_agreed: bool
     privacy_agreed: bool
     location_agreed: bool = False
+    notification_agreed: bool = False
 
     @field_validator("email")
     @classmethod
@@ -64,16 +65,19 @@ class LoginRequest(BaseModel):
 
 
 class ConsentUpdateRequest(BaseModel):
-    location_agreed: bool
+    location_agreed: bool | None = None
+    notification_agreed: bool | None = None
 
 
 class ConsentResponse(BaseModel):
     terms_agreed: bool
     privacy_agreed: bool
     location_agreed: bool
+    notification_agreed: bool
     terms_version: str
     privacy_version: str
     location_version: str
+    notification_version: str
     agreed_at: datetime
 
 
@@ -124,9 +128,11 @@ def _user_response(db: Session, user: UserRecord) -> UserResponse:
             terms_agreed=consent.terms_agreed,
             privacy_agreed=consent.privacy_agreed,
             location_agreed=consent.location_agreed,
+            notification_agreed=consent.notification_agreed,
             terms_version=consent.terms_version,
             privacy_version=consent.privacy_version,
             location_version=consent.location_version,
+            notification_version=consent.notification_version,
             agreed_at=consent.agreed_at,
         ),
     )
@@ -170,9 +176,11 @@ def signup(
         terms_agreed=True,
         privacy_agreed=True,
         location_agreed=body.location_agreed,
+        notification_agreed=body.notification_agreed,
         terms_version=settings.terms_version,
         privacy_version=settings.privacy_version,
         location_version=settings.location_consent_version,
+        notification_version=settings.notification_consent_version,
     )
     db.add(consent)
 
@@ -240,13 +248,28 @@ def update_consents(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ):
+    if (
+        body.location_agreed is None
+        and body.notification_agreed is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="변경할 동의 항목이 없습니다.",
+        )
+
     consent = _consent_for_user(db, current_user.user_id)
-    consent.location_agreed = body.location_agreed
-    consent.location_version = settings.location_consent_version
+
+    if body.location_agreed is not None:
+        consent.location_agreed = body.location_agreed
+        consent.location_version = settings.location_consent_version
+
+    if body.notification_agreed is not None:
+        consent.notification_agreed = body.notification_agreed
+        consent.notification_version = settings.notification_consent_version
+
     consent.updated_at = datetime.now(timezone.utc)
     db.commit()
     return _user_response(db, current_user)
-
 
 @auth_router.post("/logout", response_model=MessageResponse)
 def logout(_: UserRecord = Depends(get_current_user)):

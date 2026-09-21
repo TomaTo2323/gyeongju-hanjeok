@@ -121,6 +121,23 @@ class Settings(BaseSettings):
     terms_version: str = "2026-09-14"
     privacy_version: str = "2026-09-14"
     location_consent_version: str = "2026-09-14"
+    notification_consent_version: str = "2026-09-21"
+
+    # Firebase Cloud Messaging
+    firebase_project_id: str = ""
+    firebase_service_account_json: str = ""
+
+    # 비밀번호 찾기 이메일 인증
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_from_name: str = "경주한적"
+    password_reset_code_minutes: int = 10
+    password_reset_token_minutes: int = 10
+    password_reset_max_attempts: int = 5
+    password_reset_resend_seconds: int = 60
 
     # 친구 / 동행 초대
     # 실제 카카오 초대는 외부에서 접근 가능한 HTTPS 주소를 권장합니다.

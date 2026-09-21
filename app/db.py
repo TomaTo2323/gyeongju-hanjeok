@@ -123,9 +123,11 @@ class UserConsentRecord(Base):
     terms_agreed: Mapped[bool] = mapped_column(Boolean, default=False)
     privacy_agreed: Mapped[bool] = mapped_column(Boolean, default=False)
     location_agreed: Mapped[bool] = mapped_column(Boolean, default=False)
+    notification_agreed: Mapped[bool] = mapped_column(Boolean, default=False)
     terms_version: Mapped[str] = mapped_column(String(32))
     privacy_version: Mapped[str] = mapped_column(String(32))
     location_version: Mapped[str] = mapped_column(String(32))
+    notification_version: Mapped[str] = mapped_column(String(32), default="2026-09-21")
     agreed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -419,6 +421,82 @@ class NotificationRecord(Base):
     )
 
 
+
+class PushDeviceTokenRecord(Base):
+    __tablename__ = "push_device_tokens"
+
+    push_token_id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid4()),
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        index=True,
+    )
+    token: Mapped[str] = mapped_column(
+        String(512),
+        unique=True,
+        index=True,
+    )
+    platform: Mapped[str] = mapped_column(String(20), default="android")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class PasswordResetCodeRecord(Base):
+    __tablename__ = "password_reset_codes"
+
+    reset_id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid4()),
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        index=True,
+    )
+    email: Mapped[str] = mapped_column(String(255), index=True)
+    code_hash: Mapped[str] = mapped_column(String(64))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    reset_token_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+    )
+    reset_token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+
 class CommunityImageRecord(Base):
     __tablename__ = "community_images"
 
@@ -615,6 +693,49 @@ def init_db() -> None:
         connection.execute(
             text("UPDATE users SET role = 'user' WHERE role IS NULL OR role = ''")
         )
+
+
+    # 기존 user_consents 테이블에 알림 동의 컬럼을 추가합니다.
+    inspector = inspect(engine)
+    if "user_consents" in inspector.get_table_names():
+        consent_columns = {
+            column["name"]
+            for column in inspector.get_columns("user_consents")
+        }
+
+        with engine.begin() as connection:
+            if "notification_agreed" not in consent_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE user_consents "
+                        "ADD COLUMN notification_agreed BOOLEAN DEFAULT FALSE"
+                    )
+                )
+
+            if "notification_version" not in consent_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE user_consents "
+                        "ADD COLUMN notification_version VARCHAR(32) "
+                        "DEFAULT '2026-09-21'"
+                    )
+                )
+
+            connection.execute(
+                text(
+                    "UPDATE user_consents "
+                    "SET notification_agreed = FALSE "
+                    "WHERE notification_agreed IS NULL"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE user_consents "
+                    "SET notification_version = '2026-09-21' "
+                    "WHERE notification_version IS NULL "
+                    "OR notification_version = ''"
+                )
+            )
 
 
 def get_db():

@@ -144,6 +144,7 @@ def _repair_pending_request_notifications(
             title="새 친구 요청",
             message=f"{requester.nickname}님이 친구 요청을 보냈어요.",
             friendship_id=friendship.friendship_id,
+            send_push=False,
         )
         created = True
 
@@ -176,6 +177,7 @@ def _repair_pending_request_notifications(
             message=f"{requester.nickname}님이 함께 여행할 코스에 초대했어요.",
             shared_route_id=request_row.shared_route_id,
             route_request_id=request_row.request_id,
+            send_push=False,
         )
         created = True
 
