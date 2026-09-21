@@ -196,6 +196,10 @@ def request_companion(
     )
     db.add(row)
 
+    # notifications.route_request_id가 route_companion_requests.request_id를
+    # Foreign Key로 참조하므로 알림 생성 전에 요청 row를 먼저 DB에 반영합니다.
+    db.flush()
+
     _restore_or_create_companion_notification(
         db,
         row=row,
