@@ -7213,12 +7213,26 @@ class RagService:
 
     @classmethod
     def _place_aliases(cls, title: str) -> list[str]:
-        normalized = normalize_name(title)
-        aliases = [normalized] if normalized else []
+        # 관광공사 제목 뒤에 붙는 "[유네스코 세계유산]" 같은 설명 꼬리표를
+        # 장소명 인식에서 제외합니다.
+        canonical_title = _canonical_place_title(title)
+        candidates = [canonical_title, title]
 
+        aliases: list[str] = []
         gyeongju = normalize_name("경주")
-        if normalized.startswith(gyeongju) and len(normalized) >= len(gyeongju) + 2:
-            aliases.append(normalized[len(gyeongju):])
+
+        for candidate in candidates:
+            normalized = normalize_name(candidate)
+            if not normalized:
+                continue
+
+            aliases.append(normalized)
+
+            if (
+                normalized.startswith(gyeongju)
+                and len(normalized) >= len(gyeongju) + 2
+            ):
+                aliases.append(normalized[len(gyeongju):])
 
         return list(
             dict.fromkeys(
@@ -7265,12 +7279,40 @@ class RagService:
         if direct is not None:
             return direct
 
-        # "거기 몇 시까지야?" 같은 후속 질문이면 가장 최근 사용자 발화부터 거슬러 올라가
-        # 장소명을 찾습니다. 오래된 대화의 장소가 현재 질문을 덮어쓰지 않도록 역순 탐색합니다.
+        # 이전 장소를 이어받는 것은 "거기", "그곳", "그거"처럼
+        # 실제로 앞 대화를 가리키는 후속 질문일 때만 허용합니다.
+        # 새 장소명을 인식하지 못했다는 이유만으로 직전 장소를 재사용하면
+        # "첨성대 → 불국사"처럼 장소가 바뀐 질문에서 잘못된 답변이 나올 수 있습니다.
+        normalized_query = normalize_name(query)
+        contextual_tokens = (
+            "거기",
+            "거긴",
+            "거기는",
+            "거기의",
+            "그곳",
+            "그곳은",
+            "그곳의",
+            "그거",
+            "그건",
+            "그게",
+            "그장소",
+            "그관광지",
+        )
+
+        if not any(
+            normalize_name(token) in normalized_query
+            for token in contextual_tokens
+        ):
+            return None
+
         for turn in reversed(history):
             if turn.role != "user":
                 continue
-            match = self._exact_place_record(turn.content, records)
+
+            match = self._exact_place_record(
+                turn.content,
+                records,
+            )
             if match is not None:
                 return match
 
@@ -7683,24 +7725,13 @@ class RagService:
         history = history or []
 
         # -----------------------------------------------------------
-        # 1. 이전 대화 문맥 보강
+        # 1. 현재 질문을 기준으로 의미검색
         # -----------------------------------------------------------
-        # "거기", "그거" 같은 후속 질문을 위해
-        # 가장 최근 사용자 발화를 의미검색 문장에 함께 사용합니다.
-        last_user_turn = next(
-            (
-                turn.content
-                for turn in reversed(history)
-                if turn.role == "user"
-            ),
-            None,
-        )
-
-        search_text = (
-            f"{last_user_turn}\n{query}"
-            if last_user_turn
-            else query
-        )
+        # 직전 사용자 질문을 임베딩 문장에 무조건 합치면
+        # 관광지가 바뀐 질문에서 이전 장소가 검색 결과를 오염시킬 수 있습니다.
+        # "거기", "그곳" 같은 실제 후속 질문의 장소 연결은
+        # _resolve_exact_place()에서 별도로 처리합니다.
+        search_text = query
 
         # -----------------------------------------------------------
         # 2. 장소명과 구조화 질문을 먼저 처리
