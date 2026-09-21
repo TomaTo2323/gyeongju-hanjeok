@@ -9,11 +9,14 @@ from sqlalchemy.orm import Session
 
 from app.auth_service import get_current_user
 from app.db import (
+    FriendshipRecord,
     NotificationRecord,
+    RouteCompanionRequestRecord,
     UserPublicProfileRecord,
     UserRecord,
     get_db,
 )
+from app.notification_service import create_notification
 
 notification_router = APIRouter(prefix="/notifications", tags=["notifications"])
 
@@ -84,6 +87,102 @@ def _response(db: Session, row: NotificationRecord) -> NotificationResponse:
     )
 
 
+def _notification_exists(
+    db: Session,
+    *,
+    user_id: str,
+    type: str,
+    friendship_id: str | None = None,
+    route_request_id: str | None = None,
+) -> bool:
+    stmt = select(NotificationRecord.notification_id).where(
+        NotificationRecord.user_id == user_id,
+        NotificationRecord.type == type,
+    )
+    if friendship_id is not None:
+        stmt = stmt.where(NotificationRecord.friendship_id == friendship_id)
+    if route_request_id is not None:
+        stmt = stmt.where(NotificationRecord.route_request_id == route_request_id)
+    return db.scalar(stmt.limit(1)) is not None
+
+
+def _repair_pending_request_notifications(
+    db: Session,
+    current_user: UserRecord,
+) -> None:
+    """
+    이전 버전에서 요청 데이터만 저장되고 알림 레코드가 누락된 경우를 복구합니다.
+    """
+    uid = current_user.user_id
+    created = False
+
+    friendships = db.scalars(
+        select(FriendshipRecord).where(
+            FriendshipRecord.addressee_user_id == uid,
+            FriendshipRecord.status == "pending",
+        )
+    ).all()
+
+    for friendship in friendships:
+        if _notification_exists(
+            db,
+            user_id=uid,
+            type="friend_request",
+            friendship_id=friendship.friendship_id,
+        ):
+            continue
+
+        requester = db.get(UserRecord, friendship.requester_user_id)
+        if requester is None:
+            continue
+
+        create_notification(
+            db,
+            user_id=uid,
+            actor_user_id=requester.user_id,
+            type="friend_request",
+            title="새 친구 요청",
+            message=f"{requester.nickname}님이 친구 요청을 보냈어요.",
+            friendship_id=friendship.friendship_id,
+        )
+        created = True
+
+    companion_requests = db.scalars(
+        select(RouteCompanionRequestRecord).where(
+            RouteCompanionRequestRecord.recipient_user_id == uid,
+            RouteCompanionRequestRecord.status == "pending",
+        )
+    ).all()
+
+    for request_row in companion_requests:
+        if _notification_exists(
+            db,
+            user_id=uid,
+            type="shared_route_invite",
+            route_request_id=request_row.request_id,
+        ):
+            continue
+
+        requester = db.get(UserRecord, request_row.requester_user_id)
+        if requester is None:
+            continue
+
+        create_notification(
+            db,
+            user_id=uid,
+            actor_user_id=requester.user_id,
+            type="shared_route_invite",
+            title="새 동행 코스 요청",
+            message=f"{requester.nickname}님이 함께 여행할 코스에 초대했어요.",
+            shared_route_id=request_row.shared_route_id,
+            route_request_id=request_row.request_id,
+        )
+        created = True
+
+    if created:
+        db.commit()
+
+
 @notification_router.get("", response_model=NotificationListResponse)
 def list_notifications(
     unread_only: bool = Query(default=False),
@@ -91,6 +190,8 @@ def list_notifications(
     db: Session = Depends(get_db),
     current_user: UserRecord = Depends(get_current_user),
 ):
+    _repair_pending_request_notifications(db, current_user)
+
     uid = _user_id(current_user)
     stmt = select(NotificationRecord).where(NotificationRecord.user_id == uid)
     if unread_only:
@@ -119,6 +220,8 @@ def unread_count(
     db: Session = Depends(get_db),
     current_user: UserRecord = Depends(get_current_user),
 ):
+    _repair_pending_request_notifications(db, current_user)
+
     uid = _user_id(current_user)
     count = int(
         db.scalar(

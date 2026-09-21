@@ -21,6 +21,7 @@ from .db import (
     get_db,
 )
 from .member_service import ensure_public_profile, normalize_member_code, pair_key
+from .notification_service import create_notification
 
 friend_router = APIRouter(prefix="/friends", tags=["friends"])
 invite_landing_router = APIRouter(tags=["invite"])
@@ -148,6 +149,42 @@ def _find_invite_or_404(db: Session, token: str) -> FriendInviteRecord:
     return invite
 
 
+def _notify_friend_request(
+    db: Session,
+    *,
+    friendship: FriendshipRecord,
+    requester: UserRecord,
+    recipient_user_id: str,
+) -> None:
+    create_notification(
+        db,
+        user_id=recipient_user_id,
+        actor_user_id=requester.user_id,
+        type="friend_request",
+        title="새 친구 요청",
+        message=f"{requester.nickname}님이 친구 요청을 보냈어요.",
+        friendship_id=friendship.friendship_id,
+    )
+
+
+def _notify_friend_accepted(
+    db: Session,
+    *,
+    friendship: FriendshipRecord,
+    accepter: UserRecord,
+    recipient_user_id: str,
+) -> None:
+    create_notification(
+        db,
+        user_id=recipient_user_id,
+        actor_user_id=accepter.user_id,
+        type="friend_request_accepted",
+        title="친구 요청 수락",
+        message=f"{accepter.nickname}님이 친구 요청을 수락했어요.",
+        friendship_id=friendship.friendship_id,
+    )
+
+
 @friend_router.get("", response_model=FriendListResponse)
 def list_friends(
     current_user: UserRecord = Depends(get_current_user),
@@ -209,14 +246,24 @@ def request_friend(
     if existing is not None:
         if existing.status == "accepted":
             return _friendship_response(db, existing, current_user.user_id)
+
         if existing.status == "pending":
-            # 서로 친구 요청을 보냈다면 바로 수락 처리합니다.
             if existing.addressee_user_id == current_user.user_id:
                 existing.status = "accepted"
                 existing.accepted_at = _now()
                 existing.updated_at = _now()
+                db.add(existing)
+
+                _notify_friend_accepted(
+                    db,
+                    friendship=existing,
+                    accepter=current_user,
+                    recipient_user_id=existing.requester_user_id,
+                )
+
                 db.commit()
                 db.refresh(existing)
+
             return _friendship_response(db, existing, current_user.user_id)
 
     friendship = FriendshipRecord(
@@ -226,6 +273,15 @@ def request_friend(
         status="pending",
     )
     db.add(friendship)
+    db.flush()
+
+    _notify_friend_request(
+        db,
+        friendship=friendship,
+        requester=current_user,
+        recipient_user_id=target_profile.user_id,
+    )
+
     db.commit()
     db.refresh(friendship)
     return _friendship_response(db, friendship, current_user.user_id)
@@ -248,6 +304,15 @@ def accept_friend(
     friendship.status = "accepted"
     friendship.accepted_at = _now()
     friendship.updated_at = _now()
+    db.add(friendship)
+
+    _notify_friend_accepted(
+        db,
+        friendship=friendship,
+        accepter=current_user,
+        recipient_user_id=friendship.requester_user_id,
+    )
+
     db.commit()
     db.refresh(friendship)
     return _friendship_response(db, friendship, current_user.user_id)
@@ -344,10 +409,22 @@ def claim_invite(
         existing.status = "accepted"
         existing.accepted_at = existing.accepted_at or _now()
         existing.updated_at = _now()
+        db.add(existing)
 
     invite.status = "claimed"
     invite.claimed_by_user_id = current_user.user_id
     invite.claimed_at = _now()
+    db.add(invite)
+
+    db.flush()
+
+    _notify_friend_accepted(
+        db,
+        friendship=existing,
+        accepter=current_user,
+        recipient_user_id=invite.inviter_user_id,
+    )
+
     db.commit()
     db.refresh(existing)
     return _friendship_response(db, existing, current_user.user_id)
